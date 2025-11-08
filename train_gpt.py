@@ -1285,9 +1285,18 @@ args.val_files = os.path.join(data_path, args.val_files)
 # torchrun sets these env variables
 rank = int(os.environ["RANK"])
 world_size = int(os.environ["WORLD_SIZE"])
-assert 8 % world_size == 0, "world_size must be a divisor of 8"
-grad_accum_steps = 8 // world_size
+# changes for running on 2x4090
+desired_world_size = 8
+world_size_factor = desired_world_size // world_size
+original_seq_len = args.train_max_seq_len
+args.train_max_seq_len = 32 * 1024
+gradient_accumulation_steps = (original_seq_len * world_size_factor) // args.train_max_seq_len
+assert world_size * world_size_factor == desired_world_size, f"This code is designed for 8xH100. {world_size * world_size_factor=} != {desired_world_size=}"
+assert gradient_accumulation_steps * args.train_max_seq_len *  world_size_factor == desired_world_size * original_seq_len, f"{gradient_accumulation_steps * args.train_max_seq_len=} != {desired_world_size * original_seq_len=}"
 assert torch.cuda.is_available()
+# assert 8 % world_size == 0, "world_size must be a divisor of 8"
+# grad_accum_steps = 8 // world_size
+# assert torch.cuda.is_available()
 device = torch.device("cuda", int(os.environ["LOCAL_RANK"]))
 torch.cuda.set_device(device)
 dist.init_process_group(backend="nccl", device_id=device)
@@ -1500,9 +1509,12 @@ for step in range(train_steps + 1):
         break
 
     # --------------- TRAINING SECTION -----------------
-    for _ in range(grad_accum_steps):
+    for _ in range(gradient_accumulation_steps):
         inputs, targets, cum_seqlens = next(train_loader)
         model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
+    # for _ in range(grad_accum_steps):
+    #     inputs, targets, cum_seqlens = next(train_loader)
+    #     model(inputs, targets, cum_seqlens, ws_short, ws_long).backward()
     step_optimizers(step, optimizers, model)
      
     # logging
