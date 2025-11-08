@@ -3,3 +3,6 @@ tqdm
 torch
 huggingface-hub
 kernels
+pandas
+wandb
+einops
