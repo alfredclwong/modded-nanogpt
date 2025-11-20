@@ -15,6 +15,7 @@ class GPTConfig:
     rope: bool
     qk_norm: bool
     act: type[torch.nn.Module]
+    bf16: bool
 
 
 class GPT(torch.nn.Module):
@@ -32,12 +33,18 @@ class GPT(torch.nn.Module):
                 model_cfg.norm,
                 model_cfg.rope,
                 model_cfg.qk_norm,
+                torch.bfloat16 if model_cfg.bf16 else torch.float32,
             )
             for _ in range(model_cfg.num_layers)
         )
         self.ln_f = model_cfg.norm(model_cfg.dim, bias=False)
         self.head = torch.nn.Linear(model_cfg.dim, model_cfg.vocab_size, bias=False)
         torch.nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
+
+        if model_cfg.bf16:
+            for m in self.modules():
+                if isinstance(m, (torch.nn.Embedding, torch.nn.Linear)):
+                    m.bfloat16()
 
     def forward(
         self, x: torch.Tensor, y: torch.Tensor | None = None
@@ -73,10 +80,11 @@ class Block(torch.nn.Module):
         norm: type[torch.nn.Module] | partial,
         rope: bool,
         qk_norm: bool,
+        dtype: torch.dtype,
     ):
         super().__init__()
         self.norm1 = norm(dim, bias=False)
-        self.attn = Attention(dim, num_heads, rope, qk_norm, norm)
+        self.attn = Attention(dim, num_heads, rope, qk_norm, norm, dtype)
         self.norm2 = norm(dim, bias=False)
         self.mlp = MLP(dim)
 
@@ -94,6 +102,7 @@ class Attention(torch.nn.Module):
         rope: bool,
         qk_norm: bool,
         norm: type[torch.nn.Module] | partial,
+        dtype: torch.dtype,
     ):
         super().__init__()
         self.dim = dim
@@ -109,7 +118,7 @@ class Attention(torch.nn.Module):
 
         self.rope = rope
         if rope:
-            self.rotary = Rotary(self.head_dim)
+            self.rotary = Rotary(self.head_dim, dtype=dtype)
 
     def forward(self, x: torch.Tensor):
         B, T, D = x.size()
@@ -136,9 +145,10 @@ class Attention(torch.nn.Module):
 
 # https://blog.eleuther.ai/rotary-embeddings/
 class Rotary(torch.nn.Module):
-    def __init__(self, dim, base=10000):
+    def __init__(self, dim, dtype, base=10000):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2).float() / dim))
+        self.dtype = dtype
+        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
         self.register_buffer("inv_freq", inv_freq)
         self.seq_len_cached = None
         self.cos_cached = None
@@ -147,9 +157,9 @@ class Rotary(torch.nn.Module):
     def forward(self, seq_len: int, device: torch.device | str):
         if self.seq_len_cached is None or self.seq_len_cached < seq_len:
             self.seq_len_cached = seq_len
-            t = torch.arange(seq_len, device=device).type_as(self.inv_freq)
+            t = torch.arange(seq_len, device=device)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1).to(device)
+            emb = torch.cat((freqs, freqs), dim=-1).to(device=device, dtype=self.dtype)
             self.cos_cached = emb.cos()
             self.sin_cached = emb.sin()
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]

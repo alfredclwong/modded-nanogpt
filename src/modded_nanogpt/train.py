@@ -7,42 +7,30 @@ from tqdm import tqdm
 import wandb
 from modded_nanogpt.data import data_generator
 from modded_nanogpt.gpt import GPT
-from modded_nanogpt.util import next_multiple, next_power_of_2
-
-DEBUG_FACTOR = 8  # set to 1 for full training
-VRAM_GB = 20
-
-H100_VRAM_GB = 80 * 8
-VRAM_FACTOR = next_power_of_2(next_multiple(H100_VRAM_GB, VRAM_GB) // VRAM_GB)
-
-GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
-MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
-MAX_SEQ_LEN = 2048 if MINI_BATCH_SIZE > 1 else 2048 * 16 // VRAM_FACTOR
-
-TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
+from modded_nanogpt.util import next_multiple
 
 
 @dataclass(frozen=True)
 class TrainConfig:
     # data
-    train_files: str = "data/fineweb10B/fineweb_train_*.bin"
-    val_files: str = "data/fineweb10B/fineweb_val_*.bin"
-    train_batch_tokens: int = TRAIN_BATCH_TOKENS
-    train_max_seq_len: int = MAX_SEQ_LEN
-    grad_accum_steps: int = GRAD_ACCUM_STEPS
-    val_tokens: int = 10_485_760 // DEBUG_FACTOR
-    val_batch_tokens: int = TRAIN_BATCH_TOKENS
+    train_files: str
+    val_files: str
+    train_batch_tokens: int
+    train_max_seq_len: int
+    grad_accum_steps: int
+    val_tokens: int
+    val_batch_tokens: int
 
     # optimisation
-    num_steps: int = 2245 // DEBUG_FACTOR
-    lr: float = 3e-4
-    weight_decay: float = 0.0
-    betas: tuple[float, float] = (0.9, 0.999)
+    num_steps: int
+    lr: float
+    weight_decay: float
+    betas: tuple
 
     # eval and logging
-    val_steps: int = 250 // DEBUG_FACTOR  # 0 for only at end
-    save_checkpoint: bool = True
-    use_wandb: bool = False
+    val_steps: int
+    save_checkpoint: bool
+    use_wandb: bool
 
 
 class Clock:
@@ -193,10 +181,37 @@ if __name__ == "__main__":
         rope=True,
         qk_norm=True,
         act=ReLU2,
+        bf16=True,
     )
     model = GPT(model_cfg).to(device)
+
+    DEBUG_FACTOR = 8  # reduces train/val steps, 1 = full training
+    VRAM_FACTOR = 32  # reduces mini batch size and sequence length (if > 16),
+                      # increases grad accum steps to keep tokens per batch constant
+
+    GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
+    MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
+    MAX_SEQ_LEN = 2048 if MINI_BATCH_SIZE > 1 else 2048 * 16 // VRAM_FACTOR
+
+    TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
     train_cfg = TrainConfig(
-        use_wandb=True,
+        # data
+        train_files="data/fineweb10B/fineweb_train_*.bin",
+        val_files="data/fineweb10B/fineweb_val_*.bin",
+        train_batch_tokens=TRAIN_BATCH_TOKENS,
+        train_max_seq_len=MAX_SEQ_LEN,
+        grad_accum_steps=GRAD_ACCUM_STEPS,
+        val_tokens=10_485_760 // DEBUG_FACTOR,
+        val_batch_tokens=TRAIN_BATCH_TOKENS,
+        # optimisation
+        num_steps=2245 // DEBUG_FACTOR,
+        lr=3e-4,
+        weight_decay=0.0,
+        betas=(0.9, 0.999),
+        # eval and logging
+        val_steps=250 // DEBUG_FACTOR,  # 0 for only at end
+        save_checkpoint=True,
+        use_wandb=False,
     )
 
     print(f"{device=}")
@@ -208,4 +223,14 @@ if __name__ == "__main__":
     print(model)
 
     train(model, train_cfg, device)
+    torch.save(model.state_dict(), "final.pt")
+
     print("Training complete.")
+
+    max_memory_used = (
+        torch.cuda.max_memory_allocated(device) / (1024**3)
+        if device.startswith("cuda")
+        else 0.0
+    )
+    print(f"Max memory used: {max_memory_used:.2f} GB")
+
