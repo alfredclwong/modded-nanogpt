@@ -42,7 +42,7 @@ class TrainConfig:
     # eval and logging
     val_steps: int = 250 // DEBUG_FACTOR  # 0 for only at end
     save_checkpoint: bool = True
-    use_wandb: bool = True
+    use_wandb: bool = False
 
 
 class Clock:
@@ -173,7 +173,8 @@ def eval(model: GPT, train_cfg: TrainConfig, device: str) -> float:
 
 
 if __name__ == "__main__":
-    from modded_nanogpt.gpt import GPTConfig
+    from modded_nanogpt.gpt import GPTConfig, RMSNorm, ReLU2
+    from functools import partial
 
     device = (
         "cuda"
@@ -182,9 +183,21 @@ if __name__ == "__main__":
         if torch.backends.mps.is_available()
         else "cpu"
     )
-    model_cfg = GPTConfig()
+    model_cfg = GPTConfig(
+        vocab_size=next_multiple(50_257, 128),  # 50_304
+        num_layers=12,
+        num_heads=6,
+        dim=768,
+        max_seq_len=2048,
+        norm=partial(RMSNorm, elementwise_affine=False),
+        rope=True,
+        qk_norm=True,
+        act=ReLU2,
+    )
     model = GPT(model_cfg).to(device)
-    train_cfg = TrainConfig()
+    train_cfg = TrainConfig(
+        use_wandb=True,
+    )
 
     print(f"{device=}")
     print(
