@@ -60,7 +60,7 @@ class GPT(torch.nn.Module):
         x = self.ln_f(x)
 
         if y is not None:
-            logits = self.head(x)
+            logits = self.head(x).to(torch.float32)
             loss = torch.nn.functional.cross_entropy(
                 logits.view(B * T, -1), y.view(B * T), reduction="mean"
             )
