@@ -22,10 +22,12 @@ class GPT(torch.nn.Module):
     def __init__(self, model_cfg: GPTConfig):
         super().__init__()
         self.token_emb = torch.nn.Embedding(model_cfg.vocab_size, model_cfg.dim)
-        torch.nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            torch.nn.init.normal_(self.token_emb.weight, mean=0.0, std=0.02)
         if not model_cfg.rope:
             self.pos_emb = torch.nn.Embedding(model_cfg.max_seq_len, model_cfg.dim)
-            torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+            with torch.no_grad():
+                torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
         self.blocks = torch.nn.ModuleList(
             Block(
                 model_cfg.dim,
@@ -33,17 +35,19 @@ class GPT(torch.nn.Module):
                 model_cfg.norm,
                 model_cfg.rope,
                 model_cfg.qk_norm,
+                model_cfg.act,
                 torch.bfloat16 if model_cfg.bf16 else torch.float32,
             )
             for _ in range(model_cfg.num_layers)
         )
         self.ln_f = model_cfg.norm(model_cfg.dim, bias=False)
         self.head = torch.nn.Linear(model_cfg.dim, model_cfg.vocab_size, bias=False)
-        torch.nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            torch.nn.init.normal_(self.head.weight, mean=0.0, std=0.02)
 
         if model_cfg.bf16:
             for m in self.modules():
-                if isinstance(m, (torch.nn.Embedding, torch.nn.Linear)):
+                if isinstance(m, (torch.nn.Embedding, torch.nn.Linear)):  # Parameters?
                     m.bfloat16()
 
     def forward(
@@ -80,13 +84,14 @@ class Block(torch.nn.Module):
         norm: type[torch.nn.Module] | partial,
         rope: bool,
         qk_norm: bool,
+        act: type[torch.nn.Module],
         dtype: torch.dtype,
     ):
         super().__init__()
         self.norm1 = norm(dim, bias=False)
         self.attn = Attention(dim, num_heads, rope, qk_norm, norm, dtype)
         self.norm2 = norm(dim, bias=False)
-        self.mlp = MLP(dim)
+        self.mlp = MLP(dim, act)
 
     def forward(self, x: torch.Tensor):
         x = x + self.attn(self.norm1(x))
@@ -110,11 +115,12 @@ class Attention(torch.nn.Module):
         self.head_dim = dim // num_heads
         self.qk_norm = norm(self.head_dim, bias=False) if qk_norm else None
 
-        self.w_qkv = torch.nn.Linear(dim, 3 * dim, bias=False)
-        self.w_o = torch.nn.Linear(dim, dim, bias=False)
+        # collate qkvo to be same size as mlp weights for optimiser param grouping
+        self.w_qkvo = torch.nn.Parameter(torch.empty(dim, 4 * dim))
+        self.w_qkvo.label = "attn"
 
-        torch.nn.init.normal_(self.w_qkv.weight, mean=0.0, std=0.02)
-        torch.nn.init.normal_(self.w_o.weight, mean=0.0, std=0.02)
+        with torch.no_grad():
+            torch.nn.init.normal_(self.w_qkvo, mean=0.0, std=0.02)
 
         self.rope = rope
         if rope:
@@ -122,7 +128,9 @@ class Attention(torch.nn.Module):
 
     def forward(self, x: torch.Tensor):
         B, T, D = x.size()
-        qkv = self.w_qkv(x)  # (B, T, 3*D)
+        qkv = torch.nn.functional.linear(
+            x, self.w_qkvo.view(4, D, D)[:3].flatten(0, 1).type_as(x)
+        )  # (B, T, 3*D)
         qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, T, head_dim)
         q, k, v = qkv[0], qkv[1], qkv[2]  # each is (B, num_heads, T, head_dim)
@@ -139,7 +147,9 @@ class Attention(torch.nn.Module):
             0, 2, 1, 3
         ).contiguous()  # (B, T, num_heads, head_dim)
         attn_output = attn_output.view(B, T, D)  # (B, T, D)
-        output = self.w_o(attn_output)  # (B, T, D)
+        output = torch.nn.functional.linear(
+            attn_output, self.w_qkvo.view(4, D, D)[3].type_as(x)
+        )  # (B, T, D)
         return output
 
 
@@ -159,9 +169,9 @@ class Rotary(torch.nn.Module):
             self.seq_len_cached = seq_len
             t = torch.arange(seq_len, device=device)
             freqs = torch.einsum("i,j->ij", t, self.inv_freq)
-            emb = torch.cat((freqs, freqs), dim=-1).to(device=device, dtype=self.dtype)
-            self.cos_cached = emb.cos()
-            self.sin_cached = emb.sin()
+            emb = torch.cat((freqs, freqs), dim=-1).to(device)
+            self.cos_cached = emb.cos().to(self.dtype)
+            self.sin_cached = emb.sin().to(self.dtype)
         return self.cos_cached[:seq_len], self.sin_cached[:seq_len]
 
 
@@ -183,18 +193,23 @@ def apply_rotary_pos_emb(q_BHTD, k_BHTD, cos_TH, sin_TH):
 
 
 class MLP(torch.nn.Module):
-    def __init__(self, dim: int):
+    def __init__(self, dim: int, act: type[torch.nn.Module]):
         super().__init__()
-        self.c_fc = torch.nn.Linear(dim, 4 * dim, bias=False)
-        self.c_proj = torch.nn.Linear(4 * dim, dim, bias=False)
+        self.c_fc = torch.nn.Parameter(torch.empty(dim, 4 * dim))
+        self.c_fc.label = "mlp"
+        self.c_fc.lr_mul = 2.  # to account for transpose
+        self.act = act()
+        self.c_proj = torch.nn.Parameter(torch.empty(dim, 4 * dim))  # match attn weights
+        self.c_proj.label = "mlp"
 
-        torch.nn.init.kaiming_normal_(self.c_fc.weight, nonlinearity="relu")
-        torch.nn.init.kaiming_normal_(self.c_proj.weight, nonlinearity="relu")
+        with torch.no_grad():
+            torch.nn.init.kaiming_normal_(self.c_fc, nonlinearity="relu")
+            torch.nn.init.kaiming_normal_(self.c_proj, nonlinearity="relu")
 
     def forward(self, x: torch.Tensor):
-        x = self.c_fc(x)
-        x = torch.nn.functional.relu(x)
-        x = self.c_proj(x)
+        x = torch.nn.functional.linear(x, self.c_fc.T.type_as(x))
+        x = self.act(x)
+        x = torch.nn.functional.linear(x, self.c_proj.type_as(x))
         return x
 
 

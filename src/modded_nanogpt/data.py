@@ -10,12 +10,10 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 
-
-def is_cuda(device: str) -> bool:
-    return device.startswith("cuda")
+from modded_nanogpt.util import is_cuda
 
 
-def _load_data_shard(file: Path, device: str) -> torch.Tensor:
+def _load_data_shard(file: Path, device: torch.device | str) -> torch.Tensor:
     """Load a single data shard from disk into a uint16 tensor."""
     header = torch.from_file(str(file), shared=False, size=256, dtype=torch.int32)
     assert header[0] == 20240520, f"magic number mismatch in {file}"
@@ -38,7 +36,7 @@ def distributed_data_generator(
     batch_tokens: int,
     max_seq_len: int,
     grad_accum_steps: int,
-    device: str,
+    device: torch.device | str,
 ):
     """Yield mini-batches of (inputs, targets) tensors for training.
 

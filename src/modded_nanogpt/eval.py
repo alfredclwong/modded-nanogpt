@@ -1,18 +1,20 @@
 import time
 
 import torch
+import torch.distributed as dist
 from tqdm import tqdm
 
 from modded_nanogpt.data import distributed_data_generator
 from modded_nanogpt.gpt import GPT
+from modded_nanogpt.util import is_cuda, is_mps
 
 
 class Clock:
-    def __init__(self, device: str):
+    def __init__(self, device: torch.device | str):
         self.elapsed_ms = 0.0
-        if device.startswith("cuda"):
+        if is_cuda(device):
             self.sync_fn = torch.cuda.synchronize
-        elif device.startswith("mps"):
+        elif is_mps(device):
             self.sync_fn = torch.mps.synchronize
         else:
             self.sync_fn = lambda: None
@@ -36,7 +38,7 @@ def eval(
     max_seq_len: int,
     grad_accum_steps: int,
     device: str,
-) -> float:
+) -> torch.Tensor:
     model.eval()
 
     val_loss = 0.0
@@ -49,11 +51,12 @@ def eval(
     )
 
     # 1 val step = 1 mini batch (vs 1 train step = grad_accum_steps mini batches)
-    val_steps = grad_accum_steps * val_tokens // batch_tokens
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    val_steps = grad_accum_steps * val_tokens // batch_tokens // world_size
     for _ in tqdm(range(val_steps), desc="Validation", total=val_steps, leave=False):
         inputs, targets = next(val_loader)
         _, loss = model(inputs, targets)
-        val_loss += loss.item()
+        val_loss += loss
     val_loss /= val_steps
 
     model.train()
