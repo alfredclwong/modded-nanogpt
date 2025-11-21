@@ -3,7 +3,7 @@ import time
 import torch
 from tqdm import tqdm
 
-from modded_nanogpt.data import data_generator
+from modded_nanogpt.data import distributed_data_generator
 from modded_nanogpt.gpt import GPT
 
 
@@ -40,7 +40,7 @@ def eval(
     model.eval()
 
     val_loss = 0.0
-    val_loader = data_generator(
+    val_loader = distributed_data_generator(
         filename_pattern=filename_pattern,
         batch_tokens=batch_tokens,
         max_seq_len=max_seq_len,

@@ -8,6 +8,7 @@
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
 
 
 def is_cuda(device: str) -> bool:
@@ -32,7 +33,7 @@ def _load_data_shard(file: Path, device: str) -> torch.Tensor:
     return tokens
 
 
-def data_generator(
+def distributed_data_generator(
     filename_pattern: str,
     batch_tokens: int,
     max_seq_len: int,
@@ -51,10 +52,14 @@ def data_generator(
         inputs: Tensor of shape [mini_batch_size, max_seq_len], dtype torch.int32
         targets: Tensor of shape [mini_batch_size, max_seq_len], dtype torch.int64
     """
-    assert batch_tokens % (max_seq_len * grad_accum_steps) == 0, (
-        f"{batch_tokens=} % ({max_seq_len=} * {grad_accum_steps=}) != 0"
+    rank = dist.get_rank() if dist.is_initialized() else 0
+    world_size = dist.get_world_size() if dist.is_initialized() else 1
+    assert batch_tokens % (world_size * grad_accum_steps * max_seq_len) == 0, (
+        f"{batch_tokens=} % ({world_size=} * {grad_accum_steps=} * {max_seq_len=}) != 0"
     )
-    mini_batch_tokens = batch_tokens // grad_accum_steps
+
+    # mini-batches split the batch tokens across grad accum steps and data parallel workers
+    mini_batch_tokens = batch_tokens // grad_accum_steps // world_size
     mini_batch_size = mini_batch_tokens // max_seq_len
 
     files = sorted(Path().glob(filename_pattern))
@@ -73,19 +78,18 @@ def data_generator(
             pos = 0
 
         # extract mini-batch
-        input_batch = tokens[pos : pos + mini_batch_tokens]
-        target_batch = tokens[pos + 1 : pos + mini_batch_tokens + 1].view(
-            mini_batch_size, max_seq_len
-        )
-        input_batch = input_batch.view(mini_batch_size, max_seq_len)
-        target_batch = target_batch.view(mini_batch_size, max_seq_len)
-        pos += mini_batch_tokens
+        start = pos + rank * mini_batch_tokens
+        inputs = tokens[start : start + mini_batch_tokens]
+        targets = tokens[start + 1 : start + mini_batch_tokens + 1]
+        inputs = inputs.view(mini_batch_size, max_seq_len)
+        targets = targets.view(mini_batch_size, max_seq_len)
+        pos += mini_batch_tokens * world_size
 
         yield (
-            input_batch.to(
+            inputs.to(
                 device=device, dtype=torch.int32, non_blocking=is_cuda(device)
             ),
-            target_batch.to(
+            targets.to(
                 device=device, dtype=torch.int64, non_blocking=is_cuda(device)
             ),
         )

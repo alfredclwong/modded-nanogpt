@@ -4,7 +4,7 @@ import torch
 from tqdm import tqdm
 
 import wandb
-from modded_nanogpt.data import data_generator
+from modded_nanogpt.data import distributed_data_generator
 from modded_nanogpt.gpt import GPT
 from modded_nanogpt.util import next_multiple
 from modded_nanogpt.eval import eval, Clock
@@ -36,7 +36,7 @@ class TrainConfig:
 def train(model: GPT, train_cfg: TrainConfig, device: str):
     model.train()
 
-    train_loader = data_generator(
+    train_loader = distributed_data_generator(
         filename_pattern=train_cfg.train_files,
         batch_tokens=train_cfg.train_batch_tokens,
         max_seq_len=train_cfg.train_max_seq_len,
