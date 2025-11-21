@@ -1,4 +1,3 @@
-import time
 from dataclasses import dataclass
 
 import torch
@@ -8,6 +7,7 @@ import wandb
 from modded_nanogpt.data import data_generator
 from modded_nanogpt.gpt import GPT
 from modded_nanogpt.util import next_multiple
+from modded_nanogpt.eval import eval, Clock
 
 
 @dataclass(frozen=True)
@@ -31,26 +31,6 @@ class TrainConfig:
     val_steps: int
     save_checkpoint: bool
     use_wandb: bool
-
-
-class Clock:
-    def __init__(self, device: str):
-        self.elapsed_ms = 0.0
-        if device.startswith("cuda"):
-            self.sync_fn = torch.cuda.synchronize
-        elif device.startswith("mps"):
-            self.sync_fn = torch.mps.synchronize
-        else:
-            self.sync_fn = lambda: None
-
-    def start(self):
-        self.sync_fn()
-        self.t0 = time.perf_counter()
-
-    def pause(self):
-        self.sync_fn()
-        t1 = time.perf_counter()
-        self.elapsed_ms += (t1 - self.t0) * 1000.0
 
 
 def train(model: GPT, train_cfg: TrainConfig, device: str):
@@ -90,7 +70,15 @@ def train(model: GPT, train_cfg: TrainConfig, device: str):
         # --------------- VALIDATION SECTION -----------------
         if last_step or (train_cfg.val_steps > 0 and step % train_cfg.val_steps == 0):
             clock.pause()
-            val_loss = eval(model, train_cfg, device)
+            val_loss = eval(
+                model,
+                filename_pattern=train_cfg.val_files,
+                val_tokens=train_cfg.val_tokens,
+                batch_tokens=train_cfg.val_batch_tokens,
+                max_seq_len=train_cfg.train_max_seq_len,
+                grad_accum_steps=train_cfg.grad_accum_steps,
+                device=device,
+            )
             print(
                 "\n"
                 f"{step=}/{train_cfg.num_steps}"
@@ -131,33 +119,6 @@ def train(model: GPT, train_cfg: TrainConfig, device: str):
             wandb.log({"train/loss": batch_loss.item()}, step=step)
     if train_cfg.use_wandb:
         wandb.finish()
-
-
-@torch.no_grad()
-def eval(model: GPT, train_cfg: TrainConfig, device: str) -> float:
-    model.eval()
-
-    val_loss = 0.0
-    val_loader = data_generator(
-        filename_pattern=train_cfg.val_files,
-        batch_tokens=train_cfg.val_batch_tokens,
-        max_seq_len=train_cfg.train_max_seq_len,
-        grad_accum_steps=train_cfg.grad_accum_steps,
-        device=device,
-    )
-
-    # 1 val step = 1 mini batch (vs 1 train step = grad_accum_steps mini batches)
-    val_steps = (
-        train_cfg.grad_accum_steps * train_cfg.val_tokens // train_cfg.val_batch_tokens
-    )
-    for _ in tqdm(range(val_steps), desc="Validation", total=val_steps, leave=False):
-        inputs, targets = next(val_loader)
-        _, loss = model(inputs, targets)
-        val_loss += loss.item()
-    val_loss /= val_steps
-
-    model.train()
-    return val_loss
 
 
 if __name__ == "__main__":
