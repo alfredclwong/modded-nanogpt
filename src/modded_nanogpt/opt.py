@@ -23,12 +23,22 @@ class DistAdam(torch.optim.Optimizer):
         super().__init__(param_groups, defaults)
         # init state
         for p in params:
-            chunk_size = p.size(0) // self.world_size
+            # Store original size for params that need padding
+            original_size = p.size(0)
+            padded_size = self._get_padded_size(original_size)
+            chunk_size = padded_size // self.world_size
+
             exp_avg = torch.zeros_like(
                 p[:chunk_size], dtype=torch.bfloat16, device=p[0].device
             )
             exp_avg_sq = torch.zeros_like(exp_avg)
-            self.state[p] = dict(step=0, exp_avg=exp_avg, exp_avg_sq=exp_avg_sq)
+            self.state[p] = dict(
+                step=0,
+                exp_avg=exp_avg,
+                exp_avg_sq=exp_avg_sq,
+                original_size=original_size,
+                padded_size=padded_size,
+            )
         # DistributedAdam implementation by @vagrawal, @akash5474
 
         self.should_sync = False
@@ -36,6 +46,13 @@ class DistAdam(torch.optim.Optimizer):
         self._reduce_scatter_hooks = []
         self._reduce_scatter_futures = {}
         self.register_backward_hooks()
+
+    def _get_padded_size(self, size: int) -> int:
+        """Calculate padded size to make it divisible by world_size."""
+        remainder = size % self.world_size
+        if remainder == 0:
+            return size
+        return size + (self.world_size - remainder)
 
     def register_backward_hooks(self):
         for group in self.param_groups:
@@ -51,7 +68,20 @@ class DistAdam(torch.optim.Optimizer):
             return
 
         grad = param.grad
-        rank_size = grad.shape[0] // self.world_size
+        state = self.state[param]
+        original_size = state["original_size"]
+        padded_size = state["padded_size"]
+
+        # Pad gradient if necessary
+        if original_size != padded_size:
+            grad_padded = torch.zeros(
+                (padded_size,) + grad.shape[1:], dtype=grad.dtype, device=grad.device
+            )
+            grad_padded[:original_size] = grad
+            grad = grad_padded
+
+        # Now gradient is always divisible by world_size
+        rank_size = padded_size // self.world_size
         grad_slice = torch.empty_like(grad[:rank_size])
         self._reduce_scatter_futures[param] = (
             dist.reduce_scatter_tensor(
@@ -77,10 +107,24 @@ class DistAdam(torch.optim.Optimizer):
                 fut, g_slice = self._reduce_scatter_futures[param]
                 fut.wait()
 
-                rank_size = param.shape[0] // self.world_size
-                p_slice = param[rank * rank_size : (rank + 1) * rank_size]
-                lr = group["lr"] * getattr(param, "lr_mul", 1.0)
                 state = self.state[param]
+                original_size = state["original_size"]
+                padded_size = state["padded_size"]
+                rank_size = padded_size // self.world_size
+
+                # Create padded parameter view if necessary
+                if original_size != padded_size:
+                    param_padded = torch.zeros(
+                        (padded_size,) + param.shape[1:],
+                        dtype=param.dtype,
+                        device=param.device,
+                    )
+                    param_padded[:original_size] = param
+                else:
+                    param_padded = param
+
+                p_slice = param_padded[rank * rank_size : (rank + 1) * rank_size]
+                lr = group["lr"] * getattr(param, "lr_mul", 1.0)
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]
@@ -104,9 +148,23 @@ class DistAdam(torch.optim.Optimizer):
 
                 all_gather_futures.append(
                     dist.all_gather_into_tensor(
-                        param, p_slice, async_op=True
+                        param_padded, p_slice, async_op=True
                     ).get_future()
                 )
 
-        self._reduce_scatter_futures.clear()
+                # If parameter was padded, we'll need to copy back only the original portion
+                if original_size != padded_size:
+                    state["param_padded"] = param_padded
+
+        # Wait for all futures
         torch.futures.collect_all(all_gather_futures).wait()
+
+        # Copy back unpadded results
+        for group in self.param_groups:
+            for param in group["params"]:
+                state = self.state[param]
+                if "param_padded" in state:
+                    param.copy_(state["param_padded"][: state["original_size"]])
+                    del state["param_padded"]
+
+        self._reduce_scatter_futures.clear()
