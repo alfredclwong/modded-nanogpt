@@ -162,6 +162,7 @@ class SHCBlock(Block):
             self.hc[0, -self.n :] = 1.0
             # bot left
             if expansion_rate > 0:
+                self.hc[1:, 0] = 0.0
                 self.hc[layer_idx % self.n + 1, 0] = 1.0
             else:
                 self.hc[-self.n :, : self.n] = torch.eye(self.n)
