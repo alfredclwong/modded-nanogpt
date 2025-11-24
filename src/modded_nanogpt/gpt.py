@@ -1,7 +1,7 @@
 from dataclasses import dataclass
 from functools import partial
-import einops
 
+import einops
 import torch
 
 
@@ -19,7 +19,7 @@ class GPTConfig:
     bf16: bool
     hc: bool
     dynamic: bool
-    n: int
+    expansion_rate: int  # positive for HC, negative for FC
 
 
 class GPT(torch.nn.Module):
@@ -32,9 +32,12 @@ class GPT(torch.nn.Module):
             self.pos_emb = torch.nn.Embedding(model_cfg.max_seq_len, model_cfg.dim)
             with torch.no_grad():
                 torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
-        block_cls = (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
+        block_cls = (
+            (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
+        )
         self.hc = model_cfg.hc
-        self.n = model_cfg.n
+        self.expansion_rate = model_cfg.expansion_rate
+        self.n = abs(model_cfg.expansion_rate)
         self.blocks = torch.nn.ModuleList(
             block_cls(
                 layer_idx,
@@ -45,7 +48,7 @@ class GPT(torch.nn.Module):
                 model_cfg.qk_norm,
                 model_cfg.act,
                 torch.bfloat16 if model_cfg.bf16 else torch.float32,
-                model_cfg.n,
+                model_cfg.expansion_rate,
             )
             for layer_idx in range(model_cfg.num_layers * 2)
         )
@@ -69,11 +72,17 @@ class GPT(torch.nn.Module):
         if hasattr(self, "pos_emb"):
             x = x + self.pos_emb(pos)
         if self.hc:
-            x = einops.repeat(x, "b t d -> b t n d", n=self.n)
+            if self.expansion_rate > 0:
+                x = einops.repeat(x, "b t d -> b t n d", n=self.n)
+            else:
+                x = einops.rearrange(x, "b t (n f) -> b t n f", n=self.n)
         for block in self.blocks:
             x = block(x)
         if self.hc:
-            x = x.mean(dim=-2)  # average over hyper-dim
+            if self.expansion_rate > 0:
+                x = x.sum(dim=-2)  # sum over hyper-dim
+            else:
+                x = x.flatten(-2)  # flatten frac-dim
         x = self.ln_f(x)
 
         if y is not None:
@@ -125,7 +134,7 @@ class SHCBlock(Block):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        n: int,
+        expansion_rate: int,
     ):
         super().__init__(
             layer_idx,
@@ -136,24 +145,41 @@ class SHCBlock(Block):
             qk_norm,
             act,
             dtype,
-            n,
+            expansion_rate,
         )
+        self.expansion_rate = expansion_rate
+        self.n = abs(expansion_rate)
         self.hc = torch.nn.Parameter(
-            torch.empty(n + 1, n + 1) if n > 0 else
-            torch.empty(-n + 1, -n * 2)
+            torch.empty(self.n + 1, self.n + 1)
+            if self.expansion_rate > 0
+            else torch.empty(self.n + 1, self.n * 2)
         )
         self.hc.label = "shc"
         with torch.no_grad():
+            # top left
             self.hc[0, 0] = 0.0
-            self.hc[0, -n:] = 1.0
-            self.hc[layer_idx % n + 1, 0] = 1.0
+            # top right
+            self.hc[0, -self.n :] = 1.0
+            # bot left
+            if expansion_rate > 0:
+                self.hc[layer_idx % self.n + 1, 0] = 1.0
+            else:
+                self.hc[-self.n :, : self.n] = torch.eye(self.n)
+            # bot right
+            self.hc[-self.n :, -self.n :] = torch.eye(self.n)
+        print(f"hc ({layer_idx=}):\n{self.hc}")
 
     def forward(self, x: torch.Tensor):
         # x shape (B, T, n, D)
-        A = self.hc[1:].type_as(x)  # (n, n + 1)
-        B = self.hc[0, 1:].type_as(x)  # (n,)
-        hH = torch.einsum("np,btnd->btpd", A, x)  # width connection
-        h, H = hH[..., 0, :], hH[..., 1:, :]
+        A = self.hc[-self.n :].type_as(x)  # (n, n + 1) or (n, 2n)
+        B = self.hc[0, -self.n :].type_as(x)  # (n,)
+        hH = torch.einsum("np,btnd->btpd", A, x)  # width connection (p = n + 1 or 2n)
+        h = (
+            hH[..., 0, :]
+            if self.expansion_rate > 0
+            else hH[..., : self.n, :].flatten(-2)
+        )
+        H = hH[..., -self.n :, :]
         h = self.fn(self.norm(h))
         H = H + torch.einsum("n,btd->btnd", B, h)  # depth connection
         return H
@@ -170,7 +196,7 @@ class DHCBlock(SHCBlock):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        n: int,
+        expansion_rate: int,
     ):
         super().__init__(
             layer_idx,
@@ -181,13 +207,18 @@ class DHCBlock(SHCBlock):
             qk_norm,
             act,
             dtype,
-            n,
+            expansion_rate,
         )
-        self.dnorm = norm(dim, bias=False)
+        self.expansion_rate = expansion_rate
+        self.n = abs(expansion_rate)
+        self.frac_dim = dim // self.n if expansion_rate < 0 else dim
+        self.dnorm = norm(self.frac_dim, bias=False)
         self.s_a = torch.nn.Parameter(torch.empty(1))
         self.s_b = torch.nn.Parameter(torch.empty(1))
-        self.w_a = torch.nn.Parameter(torch.empty(dim, n + 1))
-        self.w_b = torch.nn.Parameter(torch.empty(dim))
+        self.w_a = torch.nn.Parameter(
+            torch.empty(self.frac_dim, self.n + 1 if self.expansion_rate > 0 else self.n * 2)
+        )
+        self.w_b = torch.nn.Parameter(torch.empty(self.frac_dim))
         self.s_a.label = "dhc"
         self.s_b.label = "dhc"
         self.w_a.label = "dhc"
@@ -199,21 +230,28 @@ class DHCBlock(SHCBlock):
             torch.nn.init.zeros_(self.w_b)
 
     def forward(self, x: torch.Tensor):
-        # x shape (B, T, n, D)
-        A = self.hc[1:]  # (n, n + 1)
-        B = self.hc[0, 1:]  # (n,)
+        # x shape (B, T, n, D) or (B, T, n, F)
+        A = self.hc[-self.n :]  # (n, n + 1) or (n, 2n)
+        B = self.hc[0, -self.n :]  # (n,)
         H_norm = self.dnorm(x.float())
         A = A + self.s_a * torch.nn.functional.tanh(
             H_norm @ self.w_a
-        )  # (B, T, n, n + 1)
-        B = B + self.s_b * torch.nn.functional.tanh(
-            H_norm @ self.w_b
-        )  # (B, T, n)
+        )  # (B, T, n, n + 1) or (B, T, n, 2n)
+        B = B + self.s_b * torch.nn.functional.tanh(H_norm @ self.w_b)  # (B, T, n)
         hH = torch.einsum("btnp,btnd->btpd", A, x.float())  # width connection
-        h, H = hH[..., 0, :], hH[..., 1:, :]
+        if self.expansion_rate > 0:
+            h = hH[..., 0, :]
+        else:
+            h = hH[..., : self.n, :].flatten(-2)
+        H = hH[..., -self.n :, :]
         h = self.fn(self.norm(h))
-        H = H + torch.einsum("btn,btd->btnd", B, h.float())  # depth connection
+        if self.expansion_rate > 0:
+            H = H + torch.einsum("btn,btd->btnd", B, h)  # depth connection
+        else:
+            h = einops.rearrange(h, "b t (n f) -> b t n f", n=self.n)
+            H = H + torch.einsum("btn,btnf->btnf", B, h)  # depth connection
         return H.type_as(x)
+
 
 class Attention(torch.nn.Module):
     def __init__(
@@ -315,7 +353,9 @@ class MLP(torch.nn.Module):
         self.c_fc.label = "mlp"
         # self.c_fc.lr_mul = 2.  # to account for transpose?
         self.act = act()
-        self.c_proj = torch.nn.Parameter(torch.empty(dim, 4 * dim))  # match attn weights
+        self.c_proj = torch.nn.Parameter(
+            torch.empty(dim, 4 * dim)
+        )  # match attn weights
         self.c_proj.label = "mlp"
 
         with torch.no_grad():

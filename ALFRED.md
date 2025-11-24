@@ -46,4 +46,7 @@ Runs
 - stellar-universe-13, 2x rtx3060, VF=4, #3, compiled, 6.6 (5.5 cuda) GB max mem, 7s/step
 - valiant-firebrand, 2x rtx3060, VF=2, #3 (1e-3 lr), compiled, crashed for unknown reason (see error.txt)
 - visionary-microwave-15, 2x rtx3070, VF=8, #4 (no-mlp init bug, no-mean bug), 7.1 (5.8 cuda) GB max mem, 18s/step
-- 
+- mild-wildflower-18, 2x rtx3070, VF=8, #4, 5.9 GB, 17s/step
+- fallen-donkey-19, 2x rtx5070, VF=2, #4 (hc=False), 10.3 GB, 2.7s/step
+- silver-snow-20, 2x rtx5060, VF=4, #4 (rate=4), 10.4 GB, 9s/step
+- -21, , , #4 (rate=-2),

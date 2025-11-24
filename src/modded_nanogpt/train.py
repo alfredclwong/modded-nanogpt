@@ -219,7 +219,7 @@ if __name__ == "__main__":
             bf16=True,
             hc=True,
             dynamic=True,
-            n=2,
+            expansion_rate=-2,
         )
         model = GPT(model_cfg).to(device)
 
