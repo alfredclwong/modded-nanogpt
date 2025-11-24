@@ -152,29 +152,29 @@ class SHCBlock(Block):
         self.hc = torch.nn.Parameter(
             torch.empty(self.n + 1, self.n + 1)
             if self.expansion_rate > 0
-            else torch.empty(self.n + 1, self.n * 2)
+            else torch.empty(self.n * 2, self.n + 1)
         )
         self.hc.label = "shc"
         with torch.no_grad():
             # top left
-            self.hc[0, 0] = 0.0
-            # top right
-            self.hc[0, -self.n :] = 1.0
+            self.hc[: -self.n, 0] = 0.0
             # bot left
+            self.hc[-self.n :, 0] = 1.0
+            # top right
             if expansion_rate > 0:
-                self.hc[1:, 0] = 0.0
-                self.hc[layer_idx % self.n + 1, 0] = 1.0
+                self.hc[0, 1:] = 0.0
+                self.hc[0, layer_idx % self.n + 1] = 1.0
             else:
-                self.hc[-self.n :, : self.n] = torch.eye(self.n)
+                self.hc[: self.n, -self.n :] = torch.eye(self.n)
             # bot right
             self.hc[-self.n :, -self.n :] = torch.eye(self.n)
         print(f"hc ({layer_idx=}):\n{self.hc}")
 
     def forward(self, x: torch.Tensor):
         # x shape (B, T, n, D)
-        A = self.hc[-self.n :].type_as(x)  # (n, n + 1) or (n, 2n)
-        B = self.hc[0, -self.n :].type_as(x)  # (n,)
-        hH = torch.einsum("np,btnd->btpd", A, x)  # width connection (p = n + 1 or 2n)
+        A = self.hc[:, -self.n :].type_as(x)  # (n + 1, n) or (2n, n)
+        B = self.hc[-self.n :, 0].type_as(x)  # (n,)
+        hH = torch.einsum("pn,btnd->btpd", A, x)  # width connection (p = n + 1 or 2n)
         h = (
             hH[..., 0, :]
             if self.expansion_rate > 0
@@ -232,14 +232,14 @@ class DHCBlock(SHCBlock):
 
     def forward(self, x: torch.Tensor):
         # x shape (B, T, n, D) or (B, T, n, F)
-        A = self.hc[-self.n :]  # (n, n + 1) or (n, 2n)
-        B = self.hc[0, -self.n :]  # (n,)
+        A = self.hc[:, -self.n :]  # (n + 1, n) or (2n, n)
+        B = self.hc[-self.n :, 0]  # (n,)
         H_norm = self.dnorm(x.float())
         A = A + self.s_a * torch.nn.functional.tanh(
             H_norm @ self.w_a
-        )  # (B, T, n, n + 1) or (B, T, n, 2n)
+        ).transpose(-2, -1)  # (B, T, n + 1, n) or (B, T, 2n, 2)
         B = B + self.s_b * torch.nn.functional.tanh(H_norm @ self.w_b)  # (B, T, n)
-        hH = torch.einsum("btnp,btnd->btpd", A, x.float())  # width connection
+        hH = torch.einsum("btpn,btnd->btpd", A, x.float())  # width connection
         if self.expansion_rate > 0:
             h = hH[..., 0, :]
         else:
