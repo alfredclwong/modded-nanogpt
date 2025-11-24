@@ -53,6 +53,13 @@ def train(model: GPT, train_cfg: TrainConfig, device: str):
     )
     if dist.is_initialized():
         optimiser = DistAdam(model.parameters(), **opt_kwargs)
+        print(
+            {
+                shape: len(group["params"])
+                for group in optimiser.param_groups
+                for shape in {p.shape for p in group["params"]}
+            }
+        )
     else:
         optimiser = torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
@@ -144,6 +151,7 @@ if __name__ == "__main__":
     import sys
     import traceback
     from functools import partial
+    from torch.nn import ReLU
 
     from modded_nanogpt.gpt import GPTConfig, ReLU2, RMSNorm
     from modded_nanogpt.util import is_cuda
@@ -209,6 +217,9 @@ if __name__ == "__main__":
             qk_norm=True,
             act=ReLU2,
             bf16=True,
+            hc=True,
+            dynamic=True,
+            expansion_rate=2,
         )
         model = GPT(model_cfg).to(device)
 
@@ -221,11 +232,11 @@ if __name__ == "__main__":
                 dist.broadcast(param.detach(), src=0)
 
         # reduces train/val steps, 1 = full training
-        DEBUG_FACTOR = 8
+        DEBUG_FACTOR = 512 if not is_cuda(device) else 8
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 2
+        VRAM_FACTOR = 64 if not is_cuda(device) else 2
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -244,12 +255,12 @@ if __name__ == "__main__":
             val_tokens=10_485_760 // DEBUG_FACTOR,
             val_batch_tokens=TRAIN_BATCH_TOKENS,
             # optimisation
-            num_steps=TRAIN_STEPS // DEBUG_FACTOR,
+            num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
             lr=3e-4,
             weight_decay=0.0,
             betas=(0.9, 0.999),
             # eval and logging
-            val_steps=TRAIN_STEPS // 20 // DEBUG_FACTOR,  # 0 for only at end
+            val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
             vals_per_ckpt=5,  # 0 for only at end
             use_wandb=False and master_process,
         )

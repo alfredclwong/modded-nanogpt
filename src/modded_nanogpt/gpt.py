@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from functools import partial
+import einops
 
 import torch
 
@@ -16,6 +17,9 @@ class GPTConfig:
     qk_norm: bool
     act: type[torch.nn.Module]
     bf16: bool
+    hc: bool
+    dynamic: bool
+    expansion_rate: int
 
 
 class GPT(torch.nn.Module):
@@ -28,8 +32,12 @@ class GPT(torch.nn.Module):
             self.pos_emb = torch.nn.Embedding(model_cfg.max_seq_len, model_cfg.dim)
             with torch.no_grad():
                 torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
+        block_cls = (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
+        self.hc = model_cfg.hc
+        self.expansion_rate = model_cfg.expansion_rate
         self.blocks = torch.nn.ModuleList(
-            Block(
+            block_cls(
+                layer_idx,
                 model_cfg.dim,
                 model_cfg.num_heads,
                 model_cfg.norm,
@@ -37,8 +45,9 @@ class GPT(torch.nn.Module):
                 model_cfg.qk_norm,
                 model_cfg.act,
                 torch.bfloat16 if model_cfg.bf16 else torch.float32,
+                model_cfg.expansion_rate,
             )
-            for _ in range(model_cfg.num_layers)
+            for layer_idx in range(model_cfg.num_layers * 2)
         )
         self.ln_f = model_cfg.norm(model_cfg.dim, bias=False)
         self.head = torch.nn.Linear(model_cfg.dim, model_cfg.vocab_size, bias=False)
@@ -59,6 +68,8 @@ class GPT(torch.nn.Module):
         x = self.token_emb(x)
         if hasattr(self, "pos_emb"):
             x = x + self.pos_emb(pos)
+        if self.hc:
+            x = einops.repeat(x, "b t d -> b t n d", n=self.expansion_rate)
         for block in self.blocks:
             x = block(x)
         x = self.ln_f(x)
@@ -79,6 +90,7 @@ class GPT(torch.nn.Module):
 class Block(torch.nn.Module):
     def __init__(
         self,
+        layer_idx: int,
         dim: int,
         num_heads: int,
         norm: type[torch.nn.Module] | partial,
@@ -86,18 +98,120 @@ class Block(torch.nn.Module):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
+        expansion_rate: int,
     ):
         super().__init__()
-        self.norm1 = norm(dim, bias=False)
-        self.attn = Attention(dim, num_heads, rope, qk_norm, norm, dtype)
-        self.norm2 = norm(dim, bias=False)
-        self.mlp = MLP(dim, act)
+        self.norm = norm(dim, bias=False)
+        if layer_idx % 2 == 0:
+            self.fn = Attention(dim, num_heads, rope, qk_norm, norm, dtype)
+        else:
+            self.fn = MLP(dim, act)
 
     def forward(self, x: torch.Tensor):
-        x = x + self.attn(self.norm1(x))
-        x = x + self.mlp(self.norm2(x))
+        x = x + self.fn(self.norm(x))
         return x
 
+
+class SHCBlock(Block):
+    def __init__(
+        self,
+        layer_idx: int,
+        dim: int,
+        num_heads: int,
+        norm: type[torch.nn.Module] | partial,
+        rope: bool,
+        qk_norm: bool,
+        act: type[torch.nn.Module],
+        dtype: torch.dtype,
+        expansion_rate: int,
+    ):
+        super().__init__(
+            layer_idx,
+            dim,
+            num_heads,
+            norm,
+            rope,
+            qk_norm,
+            act,
+            dtype,
+            expansion_rate,
+        )
+        self.hc = torch.nn.Parameter(
+            torch.empty(expansion_rate + 1, expansion_rate + 1)
+        )
+        self.hc.label = "shc"
+        with torch.no_grad():
+            self.hc[0, 0] = 0.0
+            self.hc[0, 1:] = 1.0
+            self.hc[1:, layer_idx % expansion_rate] = 1.0
+            self.hc[1:, 1:] = torch.eye(expansion_rate)
+
+    def forward(self, x: torch.Tensor):
+        # x shape (B, T, n, D)
+        A = self.hc[1:].type_as(x)  # (n, n + 1)
+        B = self.hc[0, 1:].type_as(x)  # (n,)
+        hH = torch.einsum("np,btnd->btpd", A, x)  # width connection
+        h, H = hH[..., 0, :], hH[..., 1:, :]
+        h = self.fn(self.norm(h))
+        H = H + torch.einsum("n,btd->btnd", B, h)  # depth connection
+        return H
+
+
+class DHCBlock(SHCBlock):
+    def __init__(
+        self,
+        layer_idx: int,
+        dim: int,
+        num_heads: int,
+        norm: type[torch.nn.Module] | partial,
+        rope: bool,
+        qk_norm: bool,
+        act: type[torch.nn.Module],
+        dtype: torch.dtype,
+        expansion_rate: int,
+    ):
+        super().__init__(
+            layer_idx,
+            dim,
+            num_heads,
+            norm,
+            rope,
+            qk_norm,
+            act,
+            dtype,
+            expansion_rate,
+        )
+        self.dnorm = norm(dim, bias=False)
+        self.s_a = torch.nn.Parameter(torch.empty(1))
+        self.s_b = torch.nn.Parameter(torch.empty(1))
+        self.w_a = torch.nn.Parameter(torch.empty(dim, expansion_rate + 1))
+        self.w_b = torch.nn.Parameter(torch.empty(dim))
+        self.s_a.label = "dhc"
+        self.s_b.label = "dhc"
+        self.w_a.label = "dhc"
+        self.w_b.label = "dhc"
+        with torch.no_grad():
+            self.s_a.fill_(1e-2)
+            self.s_b.fill_(1e-2)
+            torch.nn.init.zeros_(self.w_a)
+            torch.nn.init.zeros_(self.w_b)
+
+    def forward(self, x: torch.Tensor):
+        # x shape (B, T, n, D)
+        A = self.hc[1:]  # (n, n + 1)
+        B = self.hc[0, 1:]  # (n,)
+        H_norm = self.dnorm(x.float())
+        A = A + self.s_a * torch.nn.functional.tanh(
+            H_norm @ self.w_a
+        )  # (B, T, n, n + 1)
+        B = B + self.s_b * torch.nn.functional.tanh(
+            H_norm @ self.w_b
+        )  # (B, T, n)
+        hH = torch.einsum("btnp,btnd->btpd", A, x.float())  # width connection
+        h, H = hH[..., 0, :], hH[..., 1:, :]
+        h = self.fn(self.norm(h))
+        H = H + torch.einsum("btn,btd->btnd", B, h.float())  # depth connection
+        return H.type_as(x)
 
 class Attention(torch.nn.Module):
     def __init__(
@@ -197,7 +311,7 @@ class MLP(torch.nn.Module):
         super().__init__()
         self.c_fc = torch.nn.Parameter(torch.empty(dim, 4 * dim))
         self.c_fc.label = "mlp"
-        self.c_fc.lr_mul = 2.  # to account for transpose
+        # self.c_fc.lr_mul = 2.  # to account for transpose?
         self.act = act()
         self.c_proj = torch.nn.Parameter(torch.empty(dim, 4 * dim))  # match attn weights
         self.c_proj.label = "mlp"
