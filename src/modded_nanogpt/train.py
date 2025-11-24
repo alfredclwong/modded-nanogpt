@@ -182,7 +182,7 @@ if __name__ == "__main__":
         logfile = os.path.join(log_dir, f"{run_id}.txt")
         print(f"Logging to {logfile}")
 
-    def print0(s, console=True):
+    def print0(s, console=False):
         s = str(s)
         if master_process:
             if console:
@@ -219,7 +219,7 @@ if __name__ == "__main__":
             bf16=True,
             hc=True,
             dynamic=True,
-            expansion_rate=2,
+            n=2,
         )
         model = GPT(model_cfg).to(device)
 
@@ -236,7 +236,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 64 if not is_cuda(device) else 2
+        VRAM_FACTOR = 64 if not is_cuda(device) else 8
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -261,7 +261,7 @@ if __name__ == "__main__":
             betas=(0.9, 0.999),
             # eval and logging
             val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
-            vals_per_ckpt=5,  # 0 for only at end
+            vals_per_ckpt=0,  # 0 for only at end
             use_wandb=False and master_process,
         )
 
@@ -276,13 +276,6 @@ if __name__ == "__main__":
         train(model, train_cfg, device)
         print0("Training complete.")
 
-        max_memory_used = (
-            torch.cuda.max_memory_allocated(device) / (1024**3)
-            if is_cuda(device)
-            else 0.0
-        )
-        print0(f"Max memory used: {max_memory_used:.2f} GB")
-
     except Exception:
         if master_process:
             print0("An exception occurred during training:")
@@ -294,3 +287,10 @@ if __name__ == "__main__":
         if dist.is_initialized():
             dist.destroy_process_group()
         torch.save(model.state_dict(), "final.pt")
+
+        max_memory_used = (
+            torch.cuda.max_memory_allocated(device) / (1024**3)
+            if is_cuda(device)
+            else 0.0
+        )
+        print0(f"Max memory used: {max_memory_used:.2f} GB")

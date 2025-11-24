@@ -19,7 +19,7 @@ class GPTConfig:
     bf16: bool
     hc: bool
     dynamic: bool
-    expansion_rate: int
+    n: int
 
 
 class GPT(torch.nn.Module):
@@ -34,7 +34,7 @@ class GPT(torch.nn.Module):
                 torch.nn.init.normal_(self.pos_emb.weight, mean=0.0, std=0.02)
         block_cls = (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
         self.hc = model_cfg.hc
-        self.expansion_rate = model_cfg.expansion_rate
+        self.n = model_cfg.n
         self.blocks = torch.nn.ModuleList(
             block_cls(
                 layer_idx,
@@ -45,7 +45,7 @@ class GPT(torch.nn.Module):
                 model_cfg.qk_norm,
                 model_cfg.act,
                 torch.bfloat16 if model_cfg.bf16 else torch.float32,
-                model_cfg.expansion_rate,
+                model_cfg.n,
             )
             for layer_idx in range(model_cfg.num_layers * 2)
         )
@@ -69,9 +69,11 @@ class GPT(torch.nn.Module):
         if hasattr(self, "pos_emb"):
             x = x + self.pos_emb(pos)
         if self.hc:
-            x = einops.repeat(x, "b t d -> b t n d", n=self.expansion_rate)
+            x = einops.repeat(x, "b t d -> b t n d", n=self.n)
         for block in self.blocks:
             x = block(x)
+        if self.hc:
+            x = x.mean(dim=-2)  # average over hyper-dim
         x = self.ln_f(x)
 
         if y is not None:
@@ -98,7 +100,7 @@ class Block(torch.nn.Module):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        expansion_rate: int,
+        n: int,
     ):
         super().__init__()
         self.norm = norm(dim, bias=False)
@@ -123,7 +125,7 @@ class SHCBlock(Block):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        expansion_rate: int,
+        n: int,
     ):
         super().__init__(
             layer_idx,
@@ -134,17 +136,17 @@ class SHCBlock(Block):
             qk_norm,
             act,
             dtype,
-            expansion_rate,
+            n,
         )
         self.hc = torch.nn.Parameter(
-            torch.empty(expansion_rate + 1, expansion_rate + 1)
+            torch.empty(n + 1, n + 1) if n > 0 else
+            torch.empty(-n + 1, -n * 2)
         )
         self.hc.label = "shc"
         with torch.no_grad():
             self.hc[0, 0] = 0.0
-            self.hc[0, 1:] = 1.0
-            self.hc[1:, layer_idx % expansion_rate] = 1.0
-            self.hc[1:, 1:] = torch.eye(expansion_rate)
+            self.hc[0, -n:] = 1.0
+            self.hc[layer_idx % n + 1, 0] = 1.0
 
     def forward(self, x: torch.Tensor):
         # x shape (B, T, n, D)
@@ -168,7 +170,7 @@ class DHCBlock(SHCBlock):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        expansion_rate: int,
+        n: int,
     ):
         super().__init__(
             layer_idx,
@@ -179,12 +181,12 @@ class DHCBlock(SHCBlock):
             qk_norm,
             act,
             dtype,
-            expansion_rate,
+            n,
         )
         self.dnorm = norm(dim, bias=False)
         self.s_a = torch.nn.Parameter(torch.empty(1))
         self.s_b = torch.nn.Parameter(torch.empty(1))
-        self.w_a = torch.nn.Parameter(torch.empty(dim, expansion_rate + 1))
+        self.w_a = torch.nn.Parameter(torch.empty(dim, n + 1))
         self.w_b = torch.nn.Parameter(torch.empty(dim))
         self.s_a.label = "dhc"
         self.s_b.label = "dhc"
