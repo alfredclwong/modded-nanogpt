@@ -20,6 +20,10 @@ class GPTConfig:
     hc: bool
     dynamic: bool
     expansion_rate: int  # positive for HC, negative for FC
+    dnorm: type[torch.nn.Module] | partial
+    # technically these are training cfgs
+    shc_lr_mul: float
+    dhc_lr_mul: float
 
 
 class GPT(torch.nn.Module):
@@ -49,6 +53,9 @@ class GPT(torch.nn.Module):
                 model_cfg.act,
                 torch.bfloat16 if model_cfg.bf16 else torch.float32,
                 model_cfg.expansion_rate,
+                model_cfg.dnorm,
+                model_cfg.shc_lr_mul,
+                model_cfg.dhc_lr_mul,
             )
             for layer_idx in range(model_cfg.num_layers * 2)
         )
@@ -109,7 +116,10 @@ class Block(torch.nn.Module):
         qk_norm: bool,
         act: type[torch.nn.Module],
         dtype: torch.dtype,
-        n: int,
+        expansion_rate: int,
+        dnorm: type[torch.nn.Module] | partial,
+        shc_lr_mul: float,
+        dhc_lr_mul: float,
     ):
         super().__init__()
         self.norm = norm(dim, bias=False)
@@ -135,6 +145,9 @@ class SHCBlock(Block):
         act: type[torch.nn.Module],
         dtype: torch.dtype,
         expansion_rate: int,
+        dnorm: type[torch.nn.Module] | partial,
+        shc_lr_mul: float,
+        dhc_lr_mul: float,
     ):
         super().__init__(
             layer_idx,
@@ -146,6 +159,9 @@ class SHCBlock(Block):
             act,
             dtype,
             expansion_rate,
+            dnorm,
+            shc_lr_mul,
+            dhc_lr_mul,
         )
         self.expansion_rate = expansion_rate
         self.n = abs(expansion_rate)
@@ -155,6 +171,7 @@ class SHCBlock(Block):
             else torch.empty(self.n * 2, self.n + 1)
         )
         self.hc.label = "shc"
+        self.hc.lr_mul = shc_lr_mul
         with torch.no_grad():
             # top left
             self.hc[: -self.n, 0] = 0.0
@@ -175,11 +192,7 @@ class SHCBlock(Block):
         A = self.hc[:, -self.n :].type_as(x)  # (n + 1, n) or (2n, n)
         B = self.hc[-self.n :, 0].type_as(x)  # (n,)
         hH = torch.einsum("pn,btnd->btpd", A, x)  # width connection (p = n + 1 or 2n)
-        h = (
-            hH[..., 0, :]
-            if self.expansion_rate > 0
-            else hH[..., : self.n, :].flatten(-2)
-        )
+        h = hH[..., : self.n, :].flatten(-2)
         H = hH[..., -self.n :, :]
         h = self.fn(self.norm(h))
         H = H + torch.einsum("n,btd->btnd", B, h)  # depth connection
@@ -198,6 +211,9 @@ class DHCBlock(SHCBlock):
         act: type[torch.nn.Module],
         dtype: torch.dtype,
         expansion_rate: int,
+        dnorm: type[torch.nn.Module] | partial,
+        shc_lr_mul: float,
+        dhc_lr_mul: float,
     ):
         super().__init__(
             layer_idx,
@@ -209,11 +225,14 @@ class DHCBlock(SHCBlock):
             act,
             dtype,
             expansion_rate,
+            dnorm,
+            shc_lr_mul,
+            dhc_lr_mul,
         )
         self.expansion_rate = expansion_rate
         self.n = abs(expansion_rate)
         self.frac_dim = dim // self.n if expansion_rate < 0 else dim
-        self.dnorm = norm(self.frac_dim, bias=False)
+        self.dnorm = dnorm(self.frac_dim, bias=False)
         self.s_a = torch.nn.Parameter(torch.empty(1))
         self.s_b = torch.nn.Parameter(torch.empty(1))
         self.w_a = torch.nn.Parameter(
@@ -224,6 +243,10 @@ class DHCBlock(SHCBlock):
         self.s_b.label = "dhc"
         self.w_a.label = "dhc"
         self.w_b.label = "dhc"
+        self.s_a.lr_mul = dhc_lr_mul
+        self.s_b.lr_mul = dhc_lr_mul
+        self.w_a.lr_mul = dhc_lr_mul
+        self.w_b.lr_mul = dhc_lr_mul
         with torch.no_grad():
             self.s_a.fill_(1e-2)
             self.s_b.fill_(1e-2)

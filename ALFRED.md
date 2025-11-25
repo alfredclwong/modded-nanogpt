@@ -50,4 +50,10 @@ Runs
 - fallen-donkey-19, 2x rtx5070, VF=2, #4 (hc=False), 10.3 GB, 2.7s/step
 - silver-snow-20, 2x rtx5060, VF=4, #4 (rate=4), 10.4 GB, 9s/step
 - clear-shape-21, 2x rtx5070, VF=4, #4 (rate=4, dynamic=False, empty init fix), 8.5 GB, 4.0s/step
-- frac empty init fix
+- lilac-morning-22, 2x rtx5070, VF=4, #4 (rate=4), 10.5 GB, 9.4s/step
+- sleek-salad-23, 2x rtx5070, VF=4, #4, (rate=-2, frac empty init fix), 8.6 GB, 7.7s/step
+- playful-monkey-25, 2x rtx5070, VF=2, #4 (rate=1), 8.4 GB, 7.4s/step
+- dutiful-vortex-26, 2x rtx5070, VF=4, #4 (rate=-2, hc.lr_mul=8), ,
+- zesty-voice-27, 2x rtx5070, VF=4, #4 (rate=4, hc.lr_mul=8), 10.4 (8.75) GB, 9.1s/step
+- astral-wildflower-28, 2x rtx5070, VF=4, #4 (rate=4, hc.lr_mul=100), 10.4 GB, 9.0s
+- fluent-capybara-29, 2x rtx5070, VF=4, #4 (rate=4, rms w/ scale), 10.8 GB, 9.4s
