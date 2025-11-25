@@ -84,10 +84,6 @@ def distributed_data_generator(
         pos += mini_batch_tokens * world_size
 
         yield (
-            inputs.to(
-                device=device, dtype=torch.int32, non_blocking=is_cuda(device)
-            ),
-            targets.to(
-                device=device, dtype=torch.int64, non_blocking=is_cuda(device)
-            ),
+            inputs.to(device=device, dtype=torch.int32, non_blocking=is_cuda(device)),
+            targets.to(device=device, dtype=torch.int64, non_blocking=is_cuda(device)),
         )

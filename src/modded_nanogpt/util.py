@@ -13,6 +13,10 @@ def next_multiple(x: int, multiple: int) -> int:
     return ((x + multiple - 1) // multiple) * multiple
 
 
+def next_multiple_of_n(v: float | int, *, n: int):
+    return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
+
+
 def is_hc_param(name: str) -> bool:
     return any(
         name.endswith(s)

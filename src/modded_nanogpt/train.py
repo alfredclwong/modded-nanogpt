@@ -222,7 +222,7 @@ if __name__ == "__main__":
             expansion_rate=-2,
             dnorm=partial(RMSNorm, elementwise_affine=False),
             shc_lr_mul=1000.0,
-            dhc_lr_mul=1000.0,
+            dhc_lr_mul=100.0,
         )
         model = GPT(model_cfg).to(device)
 
