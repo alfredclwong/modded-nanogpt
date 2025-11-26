@@ -31,12 +31,16 @@ class GPT(torch.nn.Module):
         super().__init__()
         dtype = torch.bfloat16 if model_cfg.bf16 else torch.float32
         self.token_emb = torch.nn.Embedding(model_cfg.vocab_size, model_cfg.dim)
+        with torch.no_grad():
+            self.token_emb.weight.normal_(0, 0.02)
         self.rope = model_cfg.rope
         if self.rope:
             head_dim = model_cfg.dim // model_cfg.num_heads
             self.rotary = Rotary(head_dim, dtype=dtype)
         else:
             self.pos_emb = torch.nn.Embedding(model_cfg.max_seq_len, model_cfg.dim)
+            with torch.no_grad():
+                self.pos_emb.weight.normal_(0, 0.02)
         block_cls = (
             (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
         )
@@ -62,7 +66,7 @@ class GPT(torch.nn.Module):
         self.ln_f = model_cfg.norm(model_cfg.dim, bias=False)
         self.head = torch.nn.Linear(model_cfg.dim, model_cfg.vocab_size, bias=False)
         with torch.no_grad():
-            self.head.weight.zero_()
+            self.head.weight.normal_(0, 0.02)
 
         if model_cfg.bf16:
             for m in self.modules():
@@ -237,8 +241,8 @@ class DHCBlock(SHCBlock):
         with torch.no_grad():
             self.s_a.fill_(1e-2)
             self.s_b.fill_(1e-2)
-            torch.nn.init.zeros_(self.w_a)
-            torch.nn.init.zeros_(self.w_b)
+            self.w_a.zero_()
+            self.w_b.zero_()
 
     def forward(self, x: torch.Tensor, **kwargs):
         # x shape (B, T, n, D) or (B, T, n, F)
@@ -283,11 +287,8 @@ class Attention(torch.nn.Module):
         self.w_qkvo = torch.nn.Parameter(torch.empty(dim, 4 * dim))
         self.w_qkvo.label = "attn"  # type: ignore
 
-        std = 0.5 * (self.dim ** -0.5)
-        bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.w_qkvo.view(4, dim, dim)[:3].uniform_(-bound, bound)
-            self.w_qkvo.view(4, dim, dim)[3].zero_()
+            self.w_qkvo.normal_(0, 0.02)
 
     def forward(self, x: torch.Tensor, cos: torch.Tensor | None, sin: torch.Tensor | None):
         B, T, D = x.size()
@@ -366,11 +367,9 @@ class MLP(torch.nn.Module):
         )  # match attn weights
         self.c_proj.label = "mlp"
 
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std
         with torch.no_grad():
-            self.c_fc.uniform_(-bound, bound)
-            self.c_proj.zero_()
+            self.c_fc.normal_(0, 0.02)
+            self.c_proj.normal_(0, 0.02)
 
     def forward(self, x: torch.Tensor, **kwargs):
         x = torch.nn.functional.linear(x, self.c_fc.T.type_as(x))
