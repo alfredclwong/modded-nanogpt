@@ -60,12 +60,16 @@ Runs
 - playful-monkey-25, 2x rtx5070, VF=2, #4 (rate=1), 8.4 GB, 7.4s/step
 - dutiful-vortex-26, 2x rtx5070, VF=4, #4 (rate=-2, hc.lr_mul=8), ,
 - zesty-voice-27, 2x rtx5070, VF=4, #4 (rate=4, hc.lr_mul=8), 10.4 (8.75) GB, 9.1s/step
-- (2) astral-wildflower-28, 2x rtx5070, VF=4, #4 (rate=4, hc.lr_mul=100), 10.4 GB, 9.0s
+- (2a) astral-wildflower-28, 2x rtx5070, VF=4, #4 (rate=4, hc.lr_mul=100), 10.4 GB, 9.0s
 - fluent-capybara-29, 2x rtx5070, VF=4, #4 (rate=4, rms w/ scale), 10.8 GB, 9.4s
 - (3) polished-tree-33, 2x rtx4070, VF=4, #4 (rate=-2, shc.lr_mul=1000, dhc.lr_mul=100, rms w/ scale), 8.8 GB, 10.7s
-- 
+- driven-waterfall-34, 2x rtx4070, VF=2, #4 (zero-init, 1 rope), 10.4 GB, 3.0s
+- (1) efficient-dragon-36, 2x rtx4070, VF=2, #4, 10.2 GB, 3.0s
+- (3) ethereal-elevator-38, 2x rtx4070, VF=4, #4, 8.4 GB, 9.2s
+- (2b) youthful-cherry-39, 2x rtx4070, VF=4, #4, 9.1 GB, 10s
+- should go back to 100/10 lr_muls
 
 Highlights
 1. Baseline multi-GPU run
-2. DHCx4
+2. DHCx4 (a) DHCx2 (b)
 3. DFCx2
