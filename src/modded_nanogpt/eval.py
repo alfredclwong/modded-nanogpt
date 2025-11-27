@@ -4,7 +4,7 @@ import torch
 import torch.distributed as dist
 from tqdm import tqdm
 
-from modded_nanogpt.data import distributed_data_generator
+from modded_nanogpt.data0 import distributed_data_generator
 from modded_nanogpt.gpt import GPT
 from modded_nanogpt.util import is_cuda, is_mps
 
@@ -37,16 +37,17 @@ def eval(
     batch_tokens: int,
     max_seq_len: int,
     grad_accum_steps: int,
-    device: str,
+    device: str | torch.device,
 ) -> torch.Tensor:
     model.eval()
 
     val_loss = 0.0
     val_loader = distributed_data_generator(
         filename_pattern=filename_pattern,
-        batch_tokens=batch_tokens,
+        num_tokens=batch_tokens,
         max_seq_len=max_seq_len,
         grad_accum_steps=grad_accum_steps,
+        align_to_bos=False,
         device=device,
     )
 
@@ -54,8 +55,11 @@ def eval(
     world_size = dist.get_world_size() if dist.is_initialized() else 1
     val_steps = grad_accum_steps * val_tokens // batch_tokens // world_size
     for _ in tqdm(range(val_steps), desc="Validation", total=val_steps, leave=False):
-        inputs, targets = next(val_loader)
-        _, loss = model(inputs, targets)
+        inputs, targets, seqlens = next(val_loader)
+        if inputs.shape[0] == 1 and inputs.shape[1] % max_seq_len == 0:
+            inputs = inputs.view(-1, max_seq_len)
+            targets = targets.view(-1, max_seq_len)
+        loss = model(inputs, targets, seqlens)
         val_loss += loss
     val_loss /= val_steps
 

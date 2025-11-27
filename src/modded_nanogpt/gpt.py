@@ -2,7 +2,10 @@ from dataclasses import dataclass
 from functools import partial
 
 import einops
+from kernels import get_kernel
 import torch
+
+from modded_nanogpt.util import is_cuda
 
 
 @dataclass(frozen=True)
@@ -41,6 +44,13 @@ class GPT(torch.nn.Module):
             self.pos_emb = torch.nn.Embedding(model_cfg.max_seq_len, model_cfg.dim)
             with torch.no_grad():
                 self.pos_emb.weight.normal_(0, 0.02)
+        self.max_seq_len = model_cfg.max_seq_len
+        if torch.cuda.is_available():
+            self.flash_attn_interface = get_kernel(
+                "varunneal/flash-attention-3"
+            ).flash_attn_interface
+        else:
+            self.flash_attn_interface = None
         block_cls = (
             (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
         )
@@ -70,17 +80,22 @@ class GPT(torch.nn.Module):
 
         if model_cfg.bf16:
             for m in self.modules():
-                if isinstance(m, (torch.nn.Embedding, torch.nn.Linear, torch.nn.Parameter)):
+                if isinstance(
+                    m, (torch.nn.Embedding, torch.nn.Linear, torch.nn.Parameter)
+                ):
                     m.bfloat16()
 
     def forward(
-        self, x: torch.Tensor, y: torch.Tensor | None = None
-    ) -> tuple[torch.Tensor, torch.Tensor | None]:
-        B, T = x.size()
-        pos = torch.arange(0, T, dtype=torch.long, device=x.device).unsqueeze(0)
+        self, inputs: torch.Tensor, targets: torch.Tensor, seqlens: torch.Tensor
+    ) -> torch.Tensor:
+        if inputs.ndim == 1:
+            inputs = inputs.unsqueeze(0)
+            targets = targets.unsqueeze(0)
+        B, T = inputs.size()
 
-        x = self.token_emb(x)
+        x = self.token_emb(inputs)
         if hasattr(self, "pos_emb"):
+            pos = torch.arange(0, T, dtype=torch.long, device=inputs.device).unsqueeze(0)
             x = x + self.pos_emb(pos)
         if self.hc:
             if self.expansion_rate > 0:
@@ -92,7 +107,14 @@ class GPT(torch.nn.Module):
         else:
             cos, sin = None, None
         for block in self.blocks:
-            x = block(x, cos=cos, sin=sin)
+            x = block(
+                x,
+                seqlens=seqlens,
+                cos=cos,
+                sin=sin,
+                flash_attn_interface=self.flash_attn_interface,
+                max_seq_len=self.max_seq_len,
+            )
         if self.hc:
             if self.expansion_rate > 0:
                 x = x.sum(dim=-2)  # sum over hyper-dim
@@ -100,17 +122,13 @@ class GPT(torch.nn.Module):
                 x = x.flatten(-2)  # flatten frac-dim
         x = self.ln_f(x)
 
-        if y is not None:
-            logits = self.head(x).to(torch.float32)
-            loss = torch.nn.functional.cross_entropy(
-                logits.view(B * T, -1), y.view(B * T), reduction="mean"
-            )
-        else:
-            logits = self.head(
-                x[:, [-1], :]
-            )  # inference: return logits for last token only
-            loss = None
-        return logits, loss
+        logits = self.head(x)
+        logits = logits.float() if self.training else logits
+        loss = torch.nn.functional.cross_entropy(
+            logits.view(-1, logits.size(-1)), targets.view(-1),
+            reduction="sum" if self.training else "mean",
+        )
+        return loss
 
 
 class Block(torch.nn.Module):
@@ -227,7 +245,9 @@ class DHCBlock(SHCBlock):
         self.s_a = torch.nn.Parameter(torch.empty(1))
         self.s_b = torch.nn.Parameter(torch.empty(1))
         self.w_a = torch.nn.Parameter(
-            torch.empty(self.frac_dim, self.n + 1 if self.expansion_rate > 0 else self.n * 2)
+            torch.empty(
+                self.frac_dim, self.n + 1 if self.expansion_rate > 0 else self.n * 2
+            )
         )
         self.w_b = torch.nn.Parameter(torch.empty(self.frac_dim))
         self.s_a.label = "dhc"  # type: ignore
@@ -249,9 +269,9 @@ class DHCBlock(SHCBlock):
         A = self.hc[:, -self.n :]  # (n + 1, n) or (2n, n)
         B = self.hc[-self.n :, 0]  # (n,)
         H_norm = self.dnorm(x.float())
-        A = A + self.s_a * torch.nn.functional.tanh(
-            H_norm @ self.w_a
-        ).transpose(-2, -1)  # (B, T, n + 1, n) or (B, T, 2n, 2)
+        A = A + self.s_a * torch.nn.functional.tanh(H_norm @ self.w_a).transpose(
+            -2, -1
+        )  # (B, T, n + 1, n) or (B, T, 2n, 2)
         B = B + self.s_b * torch.nn.functional.tanh(H_norm @ self.w_b)  # (B, T, n)
         hH = torch.einsum("btpn,btnd->btpd", A, x.float())  # width connection
         if self.expansion_rate > 0:
@@ -290,25 +310,45 @@ class Attention(torch.nn.Module):
         with torch.no_grad():
             self.w_qkvo.normal_(0, 0.02)
 
-    def forward(self, x: torch.Tensor, cos: torch.Tensor | None, sin: torch.Tensor | None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        *,
+        seqlens: torch.Tensor,
+        cos: torch.Tensor | None,
+        sin: torch.Tensor | None,
+        flash_attn_interface: object | None,
+        max_seq_len: int,
+    ) -> torch.Tensor:
         B, T, D = x.size()
         qkv = torch.nn.functional.linear(
             x, self.w_qkvo.view(4, D, D)[:3].flatten(0, 1).type_as(x)
         )  # (B, T, 3*D)
-        qkv = qkv.view(B, T, 3, self.num_heads, self.head_dim)
-        qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, num_heads, T, head_dim)
-        q, k, v = qkv[0], qkv[1], qkv[2]  # each is (B, num_heads, T, head_dim)
+        q, k, v = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(2, 0, 3, 1, 4)
         if self.qk_norm is not None:
             q = self.qk_norm(q)
             k = self.qk_norm(k)
         if cos is not None and sin is not None:
             q, k = apply_rotary_pos_emb(q, k, cos, sin)
-        attn_output = torch.nn.functional.scaled_dot_product_attention(
-            q, k, v, is_causal=True
-        )  # (B, num_heads, T, head_dim)
-        attn_output = attn_output.permute(
-            0, 2, 1, 3
-        ).contiguous()  # (B, T, num_heads, head_dim)
+
+        if B > 1 or flash_attn_interface is None:
+            attn_output = torch.nn.functional.scaled_dot_product_attention(
+                q, k, v, is_causal=True
+            )  # (B, num_heads, T, head_dim)
+            attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
+        else:
+            attn_output = flash_attn_interface.flash_attn_varlen_func(
+                q[0],
+                k[0],
+                v[0],
+                cu_seqlens_q=seqlens,
+                cu_seqlens_k=seqlens,
+                max_seqlen_q=max_seq_len,
+                max_seqlen_k=max_seq_len,
+                causal=True,
+            )
+            attn_output = attn_output.view(B, T, self.num_heads, self.head_dim)
+
         attn_output = attn_output.view(B, T, D)  # (B, T, D)
         output = torch.nn.functional.linear(
             attn_output, self.w_qkvo.view(4, D, D)[3].type_as(x)

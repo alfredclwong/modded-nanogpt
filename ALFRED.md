@@ -67,9 +67,12 @@ Runs
 - (1) efficient-dragon-36, 2x rtx4070, VF=2, #4, 10.2 GB, 3.0s
 - (3) ethereal-elevator-38, 2x rtx4070, VF=4, #4, 8.4 GB, 9.2s
 - (2b) youthful-cherry-39, 2x rtx4070, VF=4, #4, 9.1 GB, 10s
-- should go back to 100/10 lr_muls
+- (2b) warm-dawn-40, 2x rtx4070, VF=4, #4, 9.1 GB, 10.5s
+- (3) misunderstood-frost-41, 2x rtx4070, VF=4, #4, 8.5 GB, 9.5s
+- (4) giddy-galaxy-42, 2x rtx4070, VF=4, #4, 8.3 GB, 8.9s
 
 Highlights
 1. Baseline multi-GPU run
 2. DHCx4 (a) DHCx2 (b)
 3. DFCx2
+4. DHCx1

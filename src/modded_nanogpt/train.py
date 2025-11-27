@@ -6,7 +6,7 @@ import torch.distributed as dist
 import wandb
 from tqdm import tqdm
 
-from modded_nanogpt.data import distributed_data_generator
+from modded_nanogpt.data0 import distributed_data_generator
 from modded_nanogpt.eval import Clock, eval
 from modded_nanogpt.gpt import GPT
 from modded_nanogpt.opt import DistAdam
@@ -36,14 +36,15 @@ class TrainConfig:
     use_wandb: bool
 
 
-def train(model: GPT, train_cfg: TrainConfig, device: str):
+def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
     model.train()
 
     train_loader = distributed_data_generator(
         filename_pattern=train_cfg.train_files,
-        batch_tokens=train_cfg.train_batch_tokens,
+        num_tokens=train_cfg.train_batch_tokens,
         max_seq_len=train_cfg.train_max_seq_len,
         grad_accum_steps=train_cfg.grad_accum_steps,
+        align_to_bos=True,
         device=device,
     )
     opt_kwargs = dict(
@@ -130,8 +131,11 @@ def train(model: GPT, train_cfg: TrainConfig, device: str):
         ):
             if isinstance(optimiser, DistAdam) and i == train_cfg.grad_accum_steps - 1:
                 optimiser.should_sync = True
-            inputs, targets = next(train_loader)
-            _, loss = model(inputs, targets)
+            inputs, targets, seqlens = next(train_loader)
+            print0(f"{inputs.shape=}, {targets.shape=}, {seqlens.shape=}")
+            inputs = inputs.view(-1, train_cfg.train_max_seq_len)
+            targets = targets.view(-1, train_cfg.train_max_seq_len)
+            loss = model(inputs, targets, seqlens)
             loss = loss / train_cfg.grad_accum_steps
             batch_loss += loss.detach()
             loss.backward()
@@ -206,12 +210,49 @@ if __name__ == "__main__":
             print0(nvidia_smi())
         print0("=" * 80)
 
+        # reduces train/val steps, 1 = full training
+        DEBUG_FACTOR = 512 if not is_cuda(device) else 8
+
+        # reduces mini batch size and sequence length (if > 16),
+        # increases grad accum steps to keep tokens per batch constant
+        VRAM_FACTOR = 64 if not is_cuda(device) else 8
+
+        GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
+        MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
+        MAX_SEQ_LEN = 2048 if MINI_BATCH_SIZE > 1 else 2048 * 16 // VRAM_FACTOR
+
+        TRAIN_STEPS = 2245
+
+        TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
+        # VAL_BATCH_TOKENS = TRAIN_BATCH_TOKENS
+        VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR
+
+        train_cfg = TrainConfig(
+            # data
+            train_files="data/fineweb10B/fineweb_train_*.bin",
+            val_files="data/fineweb10B/fineweb_val_*.bin",
+            train_batch_tokens=TRAIN_BATCH_TOKENS,
+            train_max_seq_len=MAX_SEQ_LEN,
+            grad_accum_steps=GRAD_ACCUM_STEPS,
+            val_tokens=10_485_760 // DEBUG_FACTOR,
+            val_batch_tokens=VAL_BATCH_TOKENS,
+            # optimisation
+            num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
+            lr=3e-4,
+            weight_decay=0.0,
+            betas=(0.9, 0.999),
+            # eval and logging
+            val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
+            vals_per_ckpt=0,  # 0 for only at end
+            use_wandb=False and master_process,
+        )
+
         model_cfg = GPTConfig(
             vocab_size=next_multiple(50_257, 128),  # 50_304
             num_layers=12,
             num_heads=6,
             dim=768,
-            max_seq_len=2048,
+            max_seq_len=max(MAX_SEQ_LEN, VAL_BATCH_TOKENS // (GRAD_ACCUM_STEPS * world_size)),
             norm=partial(RMSNorm, elementwise_affine=False),
             rope=True,
             qk_norm=True,
@@ -233,40 +274,6 @@ if __name__ == "__main__":
         if dist.is_initialized():
             for param in model.parameters():
                 dist.broadcast(param.detach(), src=0)
-
-        # reduces train/val steps, 1 = full training
-        DEBUG_FACTOR = 512 if not is_cuda(device) else 8
-
-        # reduces mini batch size and sequence length (if > 16),
-        # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 64 if not is_cuda(device) else 8
-
-        GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
-        MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
-        MAX_SEQ_LEN = 2048 if MINI_BATCH_SIZE > 1 else 2048 * 16 // VRAM_FACTOR
-
-        TRAIN_STEPS = 2245
-
-        TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
-        train_cfg = TrainConfig(
-            # data
-            train_files="data/fineweb10B/fineweb_train_*.bin",
-            val_files="data/fineweb10B/fineweb_val_*.bin",
-            train_batch_tokens=TRAIN_BATCH_TOKENS,
-            train_max_seq_len=MAX_SEQ_LEN,
-            grad_accum_steps=GRAD_ACCUM_STEPS,
-            val_tokens=10_485_760 // DEBUG_FACTOR,
-            val_batch_tokens=TRAIN_BATCH_TOKENS,
-            # optimisation
-            num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
-            lr=3e-4,
-            weight_decay=0.0,
-            betas=(0.9, 0.999),
-            # eval and logging
-            val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
-            vals_per_ckpt=0,  # 0 for only at end
-            use_wandb=False and master_process,
-        )
 
         print0(f"{device=}")
         print0(
