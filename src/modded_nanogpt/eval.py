@@ -56,9 +56,6 @@ def eval(
     val_steps = grad_accum_steps * val_tokens // batch_tokens // world_size
     for _ in tqdm(range(val_steps), desc="Validation", total=val_steps, leave=False):
         inputs, targets, seqlens = next(val_loader)
-        if inputs.shape[0] == 1 and inputs.shape[1] % max_seq_len == 0:
-            inputs = inputs.view(-1, max_seq_len)
-            targets = targets.view(-1, max_seq_len)
         loss = model(inputs, targets, seqlens)
         val_loss += loss
     val_loss /= val_steps

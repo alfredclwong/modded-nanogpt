@@ -3,9 +3,9 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-import wandb
 from tqdm import tqdm
 
+import wandb
 from modded_nanogpt.data0 import distributed_data_generator
 from modded_nanogpt.eval import Clock, eval
 from modded_nanogpt.gpt import GPT
@@ -132,12 +132,14 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
             if isinstance(optimiser, DistAdam) and i == train_cfg.grad_accum_steps - 1:
                 optimiser.should_sync = True
             inputs, targets, seqlens = next(train_loader)
-            print0(f"{inputs.shape=}, {targets.shape=}, {seqlens.shape=}")
-            inputs = inputs.view(-1, train_cfg.train_max_seq_len)
-            targets = targets.view(-1, train_cfg.train_max_seq_len)
             loss = model(inputs, targets, seqlens)
             loss = loss / train_cfg.grad_accum_steps
-            batch_loss += loss.detach()
+            batch_loss += (
+                loss.detach()
+                / train_cfg.train_batch_tokens
+                * train_cfg.grad_accum_steps
+                * world_size
+            )
             loss.backward()
         optimiser.step()
         optimiser.zero_grad(set_to_none=True)
@@ -155,6 +157,7 @@ if __name__ == "__main__":
     import sys
     import traceback
     from functools import partial
+
     from torch.nn import ReLU
 
     from modded_nanogpt.gpt import GPTConfig, ReLU2, RMSNorm
@@ -215,7 +218,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 64 if not is_cuda(device) else 8
+        VRAM_FACTOR = 64 if not is_cuda(device) else 4
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -252,7 +255,9 @@ if __name__ == "__main__":
             num_layers=12,
             num_heads=6,
             dim=768,
-            max_seq_len=max(MAX_SEQ_LEN, VAL_BATCH_TOKENS // (GRAD_ACCUM_STEPS * world_size)),
+            max_seq_len=max(
+                MAX_SEQ_LEN, VAL_BATCH_TOKENS // (GRAD_ACCUM_STEPS * world_size)
+            ),
             norm=partial(RMSNorm, elementwise_affine=False),
             rope=True,
             qk_norm=True,
@@ -260,15 +265,24 @@ if __name__ == "__main__":
             bf16=True,
             hc=True,
             dynamic=True,
-            expansion_rate=-2,
+            expansion_rate=2,
             dnorm=partial(RMSNorm, elementwise_affine=False),
+            window_size=256,
             shc_lr_mul=100.0,
             dhc_lr_mul=10.0,
+            kernel_options = {
+                "BLOCK_M": 128 // VRAM_FACTOR,
+                "BLOCK_N": 128 // VRAM_FACTOR,
+                "BLOCK_M1": 64 // VRAM_FACTOR,
+                "BLOCK_N1": 128 // VRAM_FACTOR,
+                "BLOCK_M2": 128 // VRAM_FACTOR,
+                "BLOCK_N2": 64 // VRAM_FACTOR,
+            },
         )
         model = GPT(model_cfg).to(device)
 
         print0("Compiling model...")
-        model = torch.compile(model, dynamic=True, fullgraph=True)
+        model = torch.compile(model, dynamic=True, fullgraph=False)
         print0("Model compiled.")
 
         if dist.is_initialized():
@@ -296,7 +310,6 @@ if __name__ == "__main__":
         print(logfile)
         if dist.is_initialized():
             dist.destroy_process_group()
-        torch.save(model.state_dict(), "final.pt")
 
         max_memory_used = (
             torch.cuda.max_memory_allocated(device) / (1024**3)
@@ -304,3 +317,5 @@ if __name__ == "__main__":
             else 0.0
         )
         print0(f"Max memory used: {max_memory_used:.2f} GB")
+
+        torch.save(model.state_dict(), "final.pt")

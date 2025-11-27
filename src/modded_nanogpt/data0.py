@@ -220,6 +220,8 @@ def distributed_data_generator(
         _cum_lengths[0] = 0
         _cum_lengths[1 : len(cum_lengths) + 1] = cum_lengths
 
+        _inputs = _inputs.unsqueeze(0)
+
         non_blocking = is_cuda(device)
         new_params = yield (
             _inputs.to(device=device, dtype=torch.int32, non_blocking=non_blocking),

@@ -36,11 +36,11 @@ Plan:
    - f32 dynamic hyper-connections
    - lr_mul and/or scaled norm
 5. Attention upgrade
-   - variable length
+   - bos alignment
+   - doc chunking via flexattention
    - yarn
    - long-short sliding window, warmup
-6. BOS alignment
-7. Muon
+6. Muon
 
 Runs
 - stoic-resonance-3, mmm4, VF=32 T=1024, #0, 111s/step
@@ -70,6 +70,8 @@ Runs
 - (2b) warm-dawn-40, 2x rtx4070, VF=4, #4, 9.1 GB, 10.5s
 - (3) misunderstood-frost-41, 2x rtx4070, VF=4, #4, 8.5 GB, 9.5s
 - (4) giddy-galaxy-42, 2x rtx4070, VF=4, #4, 8.3 GB, 8.9s
+- (1) ruby-shadow-45, 2x rtx4070ti, VF=2, #5 (fixed ws=512), 10.3 GB, 2.3s
+- (1) zany-frog-47, 2x rtx4070ti, VF=2, #5 (f/l/s ws=256), 12.3 GB, 2.6s
 
 Highlights
 1. Baseline multi-GPU run
