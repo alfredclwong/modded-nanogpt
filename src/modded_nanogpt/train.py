@@ -230,7 +230,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 64 if not is_cuda(device) else 2
+        VRAM_FACTOR = 16 if not is_cuda(device) else 2
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)

@@ -141,7 +141,7 @@ class GPT(torch.nn.Module):
             return mask
 
         if window_sizes is None or isinstance(window_sizes, int):
-            wss = [window_sizes] * len(self.blocks)
+            wss = [window_sizes] * (len(self.blocks) // 2)
         else:
             wss = window_sizes
         block_masks = [
@@ -156,6 +156,7 @@ class GPT(torch.nn.Module):
             )
             for ws in wss
         ]
+        assert len(block_masks) * 2 == len(self.blocks)
 
         kv = None
         for i, block in enumerate(self.blocks):
@@ -386,7 +387,7 @@ class Attention(torch.nn.Module):
         sin: torch.Tensor | None,
         block_mask: BlockMask,
         kernel_options: dict | None,
-        kv: torch.Tensor | None = None,
+        kv: torch.Tensor | None,
     ) -> torch.Tensor:
         B, T, D = x.size()
         if kv is None:
