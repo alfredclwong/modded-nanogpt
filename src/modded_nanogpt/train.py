@@ -67,10 +67,12 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
     if model.yoco:
         L = len(model.blocks) // 2  # 2 blocks per layer because of HC
         window_sizes = [model.window_size] * (L // 2) + [None] * (L - L // 2)
-    else:
+    elif model.hc:
         ws = model.window_size
         sws = ws // 2
         window_sizes = [None, ws, sws, sws, ws, sws, sws, None, sws, sws, sws, ws]
+    else:
+        window_sizes = None
     print(f"{window_sizes=}")
 
     if train_cfg.use_wandb:
@@ -101,6 +103,7 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
                 max_seq_len=train_cfg.train_max_seq_len,
                 grad_accum_steps=train_cfg.grad_accum_steps,
                 device=device,
+                window_sizes=window_sizes,
             )
             if dist.is_initialized():
                 dist.barrier()
@@ -141,7 +144,7 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
             if isinstance(optimiser, DistAdam) and i == train_cfg.grad_accum_steps - 1:
                 optimiser.should_sync = True
             inputs, targets, seqlens = next(train_loader)
-            loss = model(inputs, targets, seqlens)
+            loss = model(inputs, targets, seqlens, window_sizes)
             loss = loss / train_cfg.grad_accum_steps
             batch_loss += (
                 loss.detach()
@@ -227,7 +230,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 64 if not is_cuda(device) else 4
+        VRAM_FACTOR = 64 if not is_cuda(device) else 2
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -237,7 +240,7 @@ if __name__ == "__main__":
 
         TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
         # VAL_BATCH_TOKENS = TRAIN_BATCH_TOKENS
-        VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR
+        VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR // 2
 
         train_cfg = TrainConfig(
             # data
@@ -272,7 +275,7 @@ if __name__ == "__main__":
             qk_norm=True,
             act=ReLU2,
             bf16=True,
-            hc=True,
+            hc=False,
             dynamic=True,
             expansion_rate=2,
             dnorm=partial(RMSNorm, elementwise_affine=False),
@@ -287,7 +290,7 @@ if __name__ == "__main__":
                 "BLOCK_M2": 128 // VRAM_FACTOR,
                 "BLOCK_N2": 64 // VRAM_FACTOR,
             },
-            yoco=True,
+            yoco=False,
         )
         model = GPT(model_cfg).to(device)
 

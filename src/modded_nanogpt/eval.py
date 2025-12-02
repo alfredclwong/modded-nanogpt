@@ -38,10 +38,11 @@ def eval(
     max_seq_len: int,
     grad_accum_steps: int,
     device: str | torch.device,
+    window_sizes: list[int | None] | int | None,
 ) -> torch.Tensor:
     model.eval()
 
-    val_loss = 0.0
+    val_loss = torch.tensor(0.0, device=device)
     val_loader = distributed_data_generator(
         filename_pattern=filename_pattern,
         num_tokens=batch_tokens,
@@ -56,7 +57,7 @@ def eval(
     val_steps = grad_accum_steps * val_tokens // batch_tokens // world_size
     for _ in tqdm(range(val_steps), desc="Validation", total=val_steps, leave=False):
         inputs, targets, seqlens = next(val_loader)
-        loss = model(inputs, targets, seqlens)
+        loss = model(inputs, targets, seqlens, window_sizes)
         val_loss += loss
     val_loss /= val_steps
 

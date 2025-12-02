@@ -40,7 +40,8 @@ Plan:
    - doc chunking via flexattention
    - long-short sliding window
    - yarn [todo], warmup [todo]
-6. Muon
+6. YOCO
+7. Muon
 
 Runs
 - stoic-resonance-3, mmm4, VF=32 T=1024, #0, 111s/step

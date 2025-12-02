@@ -108,7 +108,7 @@ class GPT(torch.nn.Module):
         inputs: torch.Tensor,
         targets: torch.Tensor,
         seqlens: torch.Tensor,
-        window_sizes: list[int | None] | int | None = None,
+        window_sizes: list[int | None] | int | None,
     ) -> torch.Tensor:
         B, T = inputs.size()
         assert B == 1, f"Expect batch size of 1, got {inputs.shape=}"
@@ -140,9 +140,7 @@ class GPT(torch.nn.Module):
                 mask = mask & window_mask
             return mask
 
-        if window_sizes is None:
-            wss = [None] * len(self.blocks)
-        elif isinstance(window_sizes, int):
+        if window_sizes is None or isinstance(window_sizes, int):
             wss = [window_sizes] * len(self.blocks)
         else:
             wss = window_sizes
