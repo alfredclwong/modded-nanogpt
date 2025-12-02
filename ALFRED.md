@@ -38,8 +38,8 @@ Plan:
 5. Attention upgrade
    - bos alignment
    - doc chunking via flexattention
-   - yarn
-   - long-short sliding window, warmup
+   - long-short sliding window
+   - yarn [todo], warmup [todo]
 6. Muon
 
 Runs
@@ -72,6 +72,11 @@ Runs
 - (4) giddy-galaxy-42, 2x rtx4070, VF=4, #4, 8.3 GB, 8.9s
 - (1) ruby-shadow-45, 2x rtx4070ti, VF=2, #5 (fixed ws=512), 10.3 GB, 2.3s
 - (1) zany-frog-47, 2x rtx4070ti, VF=2, #5 (f/l/s ws=256), 12.3 GB, 2.6s
+- (2b) pretty-serenity-48, , VF=4, #5 (rate=2), , 9.2 GB, 8.3s
+- (3) dauntless-brook-49, , VF=4, #5 (rate=-2), , ,
+- glowing-voice-50, (rate=-2)
+- trim-rain-51, (rate=-8)
+- (4) fluent-snowflake-52
 
 Highlights
 1. Baseline multi-GPU run

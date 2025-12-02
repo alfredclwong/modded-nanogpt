@@ -34,6 +34,7 @@ class GPTConfig:
     dnorm: type[torch.nn.Module] | partial
     window_size: int
     kernel_options: dict | None
+    yoco: bool
     # technically these are training cfgs
     shc_lr_mul: float
     dhc_lr_mul: float
@@ -57,12 +58,23 @@ class GPT(torch.nn.Module):
         self.max_seq_len = model_cfg.max_seq_len
         self.window_size = model_cfg.window_size
         self.kernel_options = model_cfg.kernel_options
-        block_cls = (
-            (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
-        )
+
+        self.yoco = model_cfg.yoco
+        self.num_heads = model_cfg.num_heads
+        if self.yoco:
+            self.norm = model_cfg.norm(model_cfg.dim, bias=False)
+            self.w_kv = torch.nn.Parameter(torch.empty(model_cfg.dim, 2 * model_cfg.dim))
+            self.w_kv.label = "global"  # type: ignore
+            with torch.no_grad():
+                torch.nn.init.normal_(self.w_kv, mean=0.0, std=0.02)
+
         self.hc = model_cfg.hc
         self.expansion_rate = model_cfg.expansion_rate if self.hc else 0
         self.n = abs(self.expansion_rate)
+
+        block_cls = (
+            (DHCBlock if model_cfg.dynamic else SHCBlock) if model_cfg.hc else Block
+        )
         self.blocks = torch.nn.ModuleList(
             block_cls(
                 layer_idx,
@@ -71,7 +83,7 @@ class GPT(torch.nn.Module):
                 model_cfg.norm,
                 model_cfg.qk_norm,
                 model_cfg.act,
-                dtype,
+                use_global_kv=model_cfg.yoco and layer_idx >= model_cfg.num_layers,
                 expansion_rate=self.expansion_rate,
                 shc_lr_mul=model_cfg.shc_lr_mul,
                 dhc_lr_mul=model_cfg.dhc_lr_mul,
@@ -92,7 +104,11 @@ class GPT(torch.nn.Module):
                     m.bfloat16()
 
     def forward(
-        self, inputs: torch.Tensor, targets: torch.Tensor, seqlens: torch.Tensor
+        self,
+        inputs: torch.Tensor,
+        targets: torch.Tensor,
+        seqlens: torch.Tensor,
+        window_sizes: list[int | None] | int | None = None,
     ) -> torch.Tensor:
         B, T = inputs.size()
         assert B == 1, f"Expect batch size of 1, got {inputs.shape=}"
@@ -113,19 +129,26 @@ class GPT(torch.nn.Module):
             cos, sin = None, None
 
         doc_ids = (seqlens.unsqueeze(1) <= torch.arange(T, device=device)).sum(0)
-        def sliding_window_causal_mask(b, h, q_idx, kv_idx, window_size):
-            causal_mask = q_idx >= kv_idx
-            # Tokens can only attend within same document
-            same_doc = doc_ids[q_idx] == doc_ids[kv_idx]
-            if window_size is None:
-                return causal_mask & same_doc
-            # Apply sliding window: can only attend to tokens within window_size
-            window_mask = (q_idx - kv_idx) <= window_size
-            return causal_mask & same_doc & window_mask
 
+        def doc_mask(b, h, q_idx, kv_idx, causal: bool, window_size: int | None):
+            mask = doc_ids[q_idx] == doc_ids[kv_idx]
+            if causal:
+                causal_mask = q_idx >= kv_idx
+                mask = mask & causal_mask
+            if window_size is not None:
+                window_mask = abs(q_idx - kv_idx) <= window_size
+                mask = mask & window_mask
+            return mask
+
+        if window_sizes is None:
+            wss = [None] * len(self.blocks)
+        elif isinstance(window_sizes, int):
+            wss = [window_sizes] * len(self.blocks)
+        else:
+            wss = window_sizes
         block_masks = [
             create_block_mask(
-                partial(sliding_window_causal_mask, window_size=ws),
+                partial(doc_mask, causal=True, window_size=ws),
                 B=B,
                 H=None,
                 Q_LEN=T,
@@ -133,22 +156,32 @@ class GPT(torch.nn.Module):
                 device=device,
                 _compile=True,
             )
-            for ws in [None, self.window_size, self.window_size // 2]
-        ]  # full, short, long
+            for ws in wss
+        ]
+
+        kv = None
         for i, block in enumerate(self.blocks):
-            if i in {0, 7}:
-                block_mask = block_masks[0]  # full
-            elif i in {4, 11}:
-                block_mask = block_masks[1]  # long
-            else:
-                block_mask = block_masks[2]  # short
             x = block(
                 x,
                 cos=cos,
                 sin=sin,
-                block_mask=block_mask,
+                block_mask=block_masks[i // 2],  # 2 blocks per layer because of HC
                 kernel_options=self.kernel_options,
+                kv=kv,
             )
+            if self.yoco and i == len(self.blocks) // 2 - 1:  # evaluate global kv after first L/2 blocks
+                kv = torch.nn.functional.linear(
+                    self.norm(x),
+                    self.w_kv.T.type_as(x),
+                )
+                if self.hc:
+                    kv = kv.sum(dim=-2)  # sum over hyper-dim
+                kv = einops.rearrange(
+                    kv,
+                    "b t (a k h) -> a b k t h",
+                    k=self.num_heads,
+                    a=2,
+                ).contiguous()
 
         if self.hc:
             if self.expansion_rate > 0:
@@ -176,13 +209,13 @@ class Block(torch.nn.Module):
         norm: type[torch.nn.Module] | partial,
         qk_norm: bool,
         act: type[torch.nn.Module],
-        dtype: torch.dtype,
+        use_global_kv: bool,
         **kwargs,
     ):
         super().__init__()
         self.norm = norm(dim, bias=False)
         if layer_idx % 2 == 0:
-            self.fn = Attention(dim, num_heads, qk_norm, norm, dtype)
+            self.fn = Attention(dim, num_heads, qk_norm, norm, use_global_kv)
         else:
             self.fn = MLP(dim, act)
 
@@ -199,7 +232,7 @@ class SHCBlock(Block):
         norm: type[torch.nn.Module] | partial,
         qk_norm: bool,
         act: type[torch.nn.Module],
-        dtype: torch.dtype,
+        use_global_kv: bool,
         expansion_rate: int,
         shc_lr_mul: float,
         **kwargs,
@@ -211,7 +244,7 @@ class SHCBlock(Block):
             norm,
             qk_norm,
             act,
-            dtype,
+            use_global_kv,
         )
         self.expansion_rate = expansion_rate
         self.n = abs(expansion_rate)
@@ -259,7 +292,7 @@ class DHCBlock(SHCBlock):
         norm: type[torch.nn.Module] | partial,
         qk_norm: bool,
         act: type[torch.nn.Module],
-        dtype: torch.dtype,
+        use_global_kv: bool,
         expansion_rate: int,
         shc_lr_mul: float,
         dhc_lr_mul: float,
@@ -272,7 +305,7 @@ class DHCBlock(SHCBlock):
             norm,
             qk_norm,
             act,
-            dtype,
+            use_global_kv,
             expansion_rate,
             shc_lr_mul,
         )
@@ -309,7 +342,7 @@ class DHCBlock(SHCBlock):
             -2, -1
         )  # (B, T, n + 1, n) or (B, T, 2n, 2)
         B = B + self.s_b * torch.nn.functional.tanh(H_norm @ self.w_b)  # (B, T, n)
-        hH = torch.einsum("btpn,btnd->btpd", A, x.float())  # width connection
+        hH = torch.einsum("btpn,btnd->btpd", A, x)  # width connection
         if self.expansion_rate > 0:
             h = hH[..., 0, :]
         else:
@@ -331,7 +364,7 @@ class Attention(torch.nn.Module):
         num_heads: int,
         qk_norm: bool,
         norm: type[torch.nn.Module] | partial,
-        dtype: torch.dtype,
+        use_global_kv: bool,
     ):
         super().__init__()
         self.dim = dim
@@ -340,11 +373,12 @@ class Attention(torch.nn.Module):
         self.qk_norm = norm(self.head_dim, bias=False) if qk_norm else None
 
         # collate qkvo to be same size as mlp weights for optimiser param grouping
-        self.w_qkvo = torch.nn.Parameter(torch.empty(dim, 4 * dim))
-        self.w_qkvo.label = "attn"  # type: ignore
+        nw = 2 if use_global_kv else 4
+        self.w = torch.nn.Parameter(torch.empty(dim, nw * dim))
+        self.w.label = "attn"  # type: ignore
 
         with torch.no_grad():
-            self.w_qkvo.normal_(0, 0.02)
+            self.w.normal_(0, 0.02)
 
     def forward(
         self,
@@ -354,14 +388,24 @@ class Attention(torch.nn.Module):
         sin: torch.Tensor | None,
         block_mask: BlockMask,
         kernel_options: dict | None,
+        kv: torch.Tensor | None = None,
     ) -> torch.Tensor:
         B, T, D = x.size()
-        qkv = torch.nn.functional.linear(
-            x, self.w_qkvo.view(4, D, D)[:3].flatten(0, 1).type_as(x)
-        )  # (B, T, 3*D)
-        q, k, v = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(
-            2, 0, 3, 1, 4
-        )  # (B, num_heads, T, head_dim)
+        if kv is None:
+            qkv = torch.nn.functional.linear(
+                x, self.w.view(4, D, D)[:3].flatten(0, 1).type_as(x)
+            )  # (B, T, 3*D)
+            q, k, v = qkv.view(B, T, 3, self.num_heads, self.head_dim).permute(
+                2, 0, 3, 1, 4
+            )  # (B, num_heads, T, head_dim)
+        else:
+            q = torch.nn.functional.linear(
+                x, self.w.view(2, D, D)[0].type_as(x)
+            )  # (B, T, D)
+            q = q.view(B, T, self.num_heads, self.head_dim).permute(
+                0, 2, 1, 3
+            )  # (B, num_heads, T, head_dim)
+            k, v = kv
         if self.qk_norm is not None:
             q = self.qk_norm(q)
             k = self.qk_norm(k)
@@ -380,7 +424,7 @@ class Attention(torch.nn.Module):
         attn_output = attn_output.permute(0, 2, 1, 3).contiguous()
         attn_output = attn_output.view(B, T, D)  # (B, T, D)
         output = torch.nn.functional.linear(
-            attn_output, self.w_qkvo.view(4, D, D)[3].type_as(x)
+            attn_output, self.w.view(-1, D, D)[-1].type_as(x)
         )  # (B, T, D)
         return output
 

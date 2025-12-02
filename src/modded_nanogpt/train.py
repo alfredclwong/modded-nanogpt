@@ -64,6 +64,15 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
     else:
         optimiser = torch.optim.AdamW(model.parameters(), **opt_kwargs)
 
+    if model.yoco:
+        L = len(model.blocks) // 2  # 2 blocks per layer because of HC
+        window_sizes = [model.window_size] * (L // 2) + [None] * (L - L // 2)
+    else:
+        ws = model.window_size
+        sws = ws // 2
+        window_sizes = [None, ws, sws, sws, ws, sws, sws, None, sws, sws, sws, ws]
+    print(f"{window_sizes=}")
+
     if train_cfg.use_wandb:
         wandb.init(
             project="modded-nanogpt",
@@ -278,6 +287,7 @@ if __name__ == "__main__":
                 "BLOCK_M2": 128 // VRAM_FACTOR,
                 "BLOCK_N2": 64 // VRAM_FACTOR,
             },
+            yoco=True,
         )
         model = GPT(model_cfg).to(device)
 
