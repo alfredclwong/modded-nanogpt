@@ -342,13 +342,13 @@ class DHCBlock(SHCBlock):
             -2, -1
         )  # (B, T, n + 1, n) or (B, T, 2n, 2)
         B = B + self.s_b * torch.nn.functional.tanh(H_norm @ self.w_b)  # (B, T, n)
-        hH = torch.einsum("btpn,btnd->btpd", A, x)  # width connection
+        hH = torch.einsum("btpn,btnd->btpd", A, x.float())  # width connection
         if self.expansion_rate > 0:
             h = hH[..., 0, :]
         else:
             h = hH[..., : self.n, :].flatten(-2)
         H = hH[..., -self.n :, :]
-        h = self.fn(self.norm(h), **kwargs)
+        h = self.fn(self.norm(h.type_as(x)), **kwargs)
         if self.expansion_rate > 0:
             H = H + torch.einsum("btn,btd->btnd", B, h)  # depth connection
         else:
