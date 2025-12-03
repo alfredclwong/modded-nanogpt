@@ -12,6 +12,7 @@ class OptimConfig:
     eps: float
     weight_decay: float
     ortho_fn: Callable[[torch.Tensor], torch.Tensor] | None
+    lr_schedule_fn: Callable[[int], float] | None
 
 
 @torch.compile(dynamic=False, fullgraph=True)
@@ -31,6 +32,17 @@ def newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.T
     return X
 
 
+def get_lr_schedule(step: int, num_steps: int, cooldown_frac: float):
+    # learning rate schedule: flat, then linear decay, then flat
+    x = min(0.9999, step / num_steps)
+    assert 0 <= x < 1
+    lr = 1.0
+    if x >= 1 - cooldown_frac:
+        w = (1 - x) / cooldown_frac
+        lr = w * 1.0 + (1 - w) * 0.1
+    return lr
+
+
 class DistAdam(torch.optim.Optimizer):
     def __init__(
         self,
@@ -41,6 +53,7 @@ class DistAdam(torch.optim.Optimizer):
         eps: float,
         weight_decay: float,
         ortho_fn: Callable[[torch.Tensor], torch.Tensor] | None,
+        lr_schedule_fn: Callable[[int], float] | None,
     ):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -79,6 +92,7 @@ class DistAdam(torch.optim.Optimizer):
         self.register_backward_hooks()
 
         self.ortho_fn = ortho_fn
+        self.lr_schedule_fn = lr_schedule_fn
 
     def _get_padded_size(self, size: int) -> int:
         """Calculate padded size to make it divisible by world_size."""
@@ -158,6 +172,8 @@ class DistAdam(torch.optim.Optimizer):
 
                 p_slice = param_padded[rank * rank_size : (rank + 1) * rank_size]
                 lr = group["lr"] * getattr(param, "lr_mul", 1.0)
+                if self.lr_schedule_fn is not None:
+                    lr *= self.lr_schedule_fn(state["step"])
 
                 exp_avg = state["exp_avg"]
                 exp_avg_sq = state["exp_avg_sq"]

@@ -67,7 +67,13 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
         ]
     else:
         optimisers = [
-            torch.optim.AdamW(model.parameters(), **train_cfg.adam_cfg.__dict__)
+            torch.optim.AdamW(
+                model.parameters(),
+                lr=train_cfg.adam_cfg.lr,
+                betas=train_cfg.adam_cfg.betas,
+                eps=train_cfg.adam_cfg.eps,
+                weight_decay=train_cfg.adam_cfg.weight_decay,
+            )
         ]
 
     if model.yoco:
@@ -184,7 +190,7 @@ if __name__ == "__main__":
     from torch.nn import ReLU
 
     from modded_nanogpt.gpt import GPTConfig, ReLU2, RMSNorm
-    from modded_nanogpt.opt import newtonschulz5
+    from modded_nanogpt.opt import newtonschulz5, get_lr_schedule
     from modded_nanogpt.util import is_cuda
 
     device = (
@@ -248,12 +254,13 @@ if __name__ == "__main__":
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
         MAX_SEQ_LEN = 2048 if MINI_BATCH_SIZE > 1 else 2048 * 16 // VRAM_FACTOR
 
-        TRAIN_STEPS = 2245
+        TRAIN_STEPS = max(1, 2245 // DEBUG_FACTOR)
 
         TRAIN_BATCH_TOKENS = MAX_SEQ_LEN * MINI_BATCH_SIZE * GRAD_ACCUM_STEPS
         # VAL_BATCH_TOKENS = TRAIN_BATCH_TOKENS
         VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR // 2
 
+        lr_schedule_fn=partial(get_lr_schedule, num_steps=TRAIN_STEPS, cooldown_frac=0.5)
         train_cfg = TrainConfig(
             # data
             train_files="data/fineweb10B/fineweb_train_*.bin",
@@ -264,13 +271,14 @@ if __name__ == "__main__":
             val_tokens=10_485_760 // DEBUG_FACTOR,
             val_batch_tokens=VAL_BATCH_TOKENS,
             # optimisation
-            num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
+            num_steps=TRAIN_STEPS,
             adam_cfg=OptimConfig(
                 lr=8e-3,
                 betas=(0.65, 0.95),
                 eps=1e-8,
                 weight_decay=0.0,
                 ortho_fn=None,
+                lr_schedule_fn=lr_schedule_fn,
             ),
             muon_cfg=OptimConfig(
                 lr=0.03,
@@ -278,9 +286,10 @@ if __name__ == "__main__":
                 eps=1e-8,
                 weight_decay=1.2,
                 ortho_fn=newtonschulz5,
+                lr_schedule_fn=lr_schedule_fn,
             ),
             # eval and logging
-            val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
+            val_steps=max(1, TRAIN_STEPS // 20),  # 0 for only at end
             vals_per_ckpt=0,  # 0 for only at end
             use_wandb=False and master_process,
         )
@@ -302,7 +311,7 @@ if __name__ == "__main__":
             dynamic=True,
             expansion_rate=2,
             dnorm=partial(RMSNorm, elementwise_affine=False),
-            window_size=256,
+            window_size=128,
             shc_lr_mul=100.0,
             dhc_lr_mul=10.0,
             kernel_options={

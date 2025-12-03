@@ -103,6 +103,10 @@ class GPT(torch.nn.Module):
                 ):
                     m.bfloat16()
 
+        for p in self.token_emb.parameters():
+            p.lr_mul = 75.
+        self.head.weight.lr_mul = 1.
+
     def forward(
         self,
         inputs: torch.Tensor,
@@ -472,7 +476,7 @@ class MLP(torch.nn.Module):
         super().__init__()
         self.c_fc = torch.nn.Parameter(torch.empty(dim, 4 * dim))
         self.c_fc.label = "mlp"
-        # self.c_fc.lr_mul = 2.  # to account for transpose?
+        self.c_fc.lr_mul = 2.  # to account for transpose?
         self.act = act()
         self.c_proj = torch.nn.Parameter(
             torch.empty(dim, 4 * dim)
