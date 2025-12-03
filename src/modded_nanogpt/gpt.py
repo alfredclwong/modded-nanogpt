@@ -94,7 +94,7 @@ class GPT(torch.nn.Module):
         self.ln_f = model_cfg.norm(model_cfg.dim, bias=False)
         self.head = torch.nn.Linear(model_cfg.dim, model_cfg.vocab_size, bias=False)
         with torch.no_grad():
-            self.head.weight.normal_(0, 0.02)
+            self.head.weight.zero_()
 
         if model_cfg.bf16:
             for m in self.modules():
@@ -381,7 +381,8 @@ class Attention(torch.nn.Module):
         self.w.label = "attn"  # type: ignore
 
         with torch.no_grad():
-            self.w.normal_(0, 0.02)
+            self.w.view(4, dim, dim)[:3].normal_(0, 0.02)
+            self.w.view(4, dim, dim)[-1].zero_()
 
     def forward(
         self,
@@ -485,7 +486,7 @@ class MLP(torch.nn.Module):
 
         with torch.no_grad():
             self.c_fc.normal_(0, 0.02)
-            self.c_proj.normal_(0, 0.02)
+            self.c_proj.zero_()
 
     def forward(self, x: torch.Tensor, **kwargs):
         x = torch.nn.functional.linear(x, self.c_fc.T.type_as(x))

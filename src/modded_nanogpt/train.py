@@ -79,12 +79,12 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
     if model.yoco:
         L = len(model.blocks) // 2  # 2 blocks per layer because of HC
         window_sizes = [model.window_size] * (L // 2) + [None] * (L - L // 2)
-    elif model.hc:
+    elif model.window_size is None:
+        window_sizes = None
+    else:
         ws = model.window_size
         sws = ws // 2
         window_sizes = [None, ws, sws, sws, ws, sws, sws, None, sws, sws, sws, ws]
-    else:
-        window_sizes = None
     print(f"{window_sizes=}")
 
     if train_cfg.use_wandb:
@@ -248,7 +248,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 16 if not is_cuda(device) else 4
+        VRAM_FACTOR = 16 if not is_cuda(device) else 2
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -260,7 +260,8 @@ if __name__ == "__main__":
         # VAL_BATCH_TOKENS = TRAIN_BATCH_TOKENS
         VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR // 2
 
-        lr_schedule_fn=partial(get_lr_schedule, num_steps=TRAIN_STEPS, cooldown_frac=0.5)
+        lr_schedule_fn = partial(get_lr_schedule, num_steps=TRAIN_STEPS * DEBUG_FACTOR, cooldown_frac=0.5)
+        # lr_schedule_fn = None
         train_cfg = TrainConfig(
             # data
             train_files="data/fineweb10B/fineweb_train_*.bin",
@@ -281,10 +282,10 @@ if __name__ == "__main__":
                 lr_schedule_fn=lr_schedule_fn,
             ),
             muon_cfg=OptimConfig(
-                lr=0.03,
+                lr=3e-2,
                 betas=(0.95, 0.95),
-                eps=1e-8,
-                weight_decay=1.2,
+                eps=1e-10,
+                weight_decay=0.0,
                 ortho_fn=newtonschulz5,
                 lr_schedule_fn=lr_schedule_fn,
             ),
@@ -311,7 +312,7 @@ if __name__ == "__main__":
             dynamic=True,
             expansion_rate=2,
             dnorm=partial(RMSNorm, elementwise_affine=False),
-            window_size=128,
+            window_size=256,
             shc_lr_mul=100.0,
             dhc_lr_mul=10.0,
             kernel_options={

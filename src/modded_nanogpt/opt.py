@@ -176,7 +176,6 @@ class DistAdam(torch.optim.Optimizer):
                     lr *= self.lr_schedule_fn(state["step"])
 
                 exp_avg = state["exp_avg"]
-                exp_avg_sq = state["exp_avg_sq"]
                 state["step"] += 1
                 t = state["step"]
                 # weight decay
@@ -185,17 +184,20 @@ class DistAdam(torch.optim.Optimizer):
                     p_slice.mul_(1 - eff_weight_decay)
                 # update running averages
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(exp_avg, exp_avg, value=1 - beta2)
-                # orthogonalisation step
-                if self.ortho_fn is not None:
-                    exp_avg = self.ortho_fn(exp_avg)
                 # bias corrections
                 bias1 = 1 - beta1**t
-                bias2 = 1 - beta2**t
-                # compute step
-                denom = exp_avg_sq.sqrt().add_(eps)
-                step_size = lr * (bias2**0.5 / bias1)
-                update = exp_avg.div(denom).mul_(step_size)
+                if self.ortho_fn is None:
+                    # compute step
+                    exp_avg_sq = state["exp_avg_sq"]
+                    exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                    bias2 = 1 - beta2**t
+                    denom = exp_avg_sq.sqrt().add_(eps)
+                    step_size = lr * (bias2**0.5 / bias1)
+                    update = exp_avg.div(denom).mul_(step_size)
+                else:
+                    # orthogonalisation step
+                    exp_avg = self.ortho_fn(exp_avg)
+                    update = exp_avg.mul_(lr / bias1)
                 p_slice.add_(other=update, alpha=-1.0)
 
                 all_gather_futures.append(
