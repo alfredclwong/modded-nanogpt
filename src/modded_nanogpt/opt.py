@@ -1,7 +1,17 @@
+from dataclasses import dataclass
 from typing import Callable
 
 import torch
 import torch.distributed as dist
+
+
+@dataclass(frozen=True)
+class OptimConfig:
+    lr: float
+    betas: tuple[float, float]
+    eps: float
+    weight_decay: float
+    ortho_fn: Callable[[torch.Tensor], torch.Tensor] | None
 
 
 @torch.compile(dynamic=False, fullgraph=True)

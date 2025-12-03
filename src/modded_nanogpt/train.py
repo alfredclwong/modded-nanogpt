@@ -1,7 +1,6 @@
 import uuid
-from dataclasses import dataclass
-from typing import Callable
 from collections import Counter
+from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
@@ -11,7 +10,7 @@ import wandb
 from modded_nanogpt.data0 import distributed_data_generator
 from modded_nanogpt.eval import Clock, eval
 from modded_nanogpt.gpt import GPT
-from modded_nanogpt.opt import DistAdam
+from modded_nanogpt.opt import DistAdam, OptimConfig
 from modded_nanogpt.util import next_multiple
 
 
@@ -28,11 +27,8 @@ class TrainConfig:
 
     # optimisation
     num_steps: int
-    lr_adam: float
-    lr_muon: float
-    weight_decay: float
-    betas: tuple[float, float]
-    ortho_fn: Callable[[torch.Tensor], torch.Tensor]
+    adam_cfg: OptimConfig
+    muon_cfg: OptimConfig
 
     # eval and logging
     val_steps: int
@@ -51,11 +47,6 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
         align_to_bos=True,
         device=device,
     )
-    opt_kwargs: dict = dict(
-        weight_decay=train_cfg.weight_decay,
-        betas=train_cfg.betas,
-        eps=1e-8,
-    )
 
     adam_params = []
     muon_params = []
@@ -71,11 +62,13 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
 
     if dist.is_initialized():
         optimisers = [
-            DistAdam(adam_params, ortho_fn=None, lr=train_cfg.lr_adam, **opt_kwargs),
-            DistAdam(muon_params, ortho_fn=train_cfg.ortho_fn, lr=train_cfg.lr_muon, **opt_kwargs),
+            DistAdam(adam_params, **train_cfg.adam_cfg.__dict__),
+            DistAdam(muon_params, **train_cfg.muon_cfg.__dict__),
         ]
     else:
-        optimisers = [torch.optim.AdamW(model.parameters(), lr=train_cfg.lr_adam, **opt_kwargs)]
+        optimisers = [
+            torch.optim.AdamW(model.parameters(), **train_cfg.adam_cfg.__dict__)
+        ]
 
     if model.yoco:
         L = len(model.blocks) // 2  # 2 blocks per layer because of HC
@@ -272,11 +265,20 @@ if __name__ == "__main__":
             val_batch_tokens=VAL_BATCH_TOKENS,
             # optimisation
             num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
-            lr_adam=3e-4,
-            lr_muon=3e-2,
-            weight_decay=0.0,
-            betas=(0.95, 0.95),
-            ortho_fn=newtonschulz5,
+            adam_cfg=OptimConfig(
+                lr=8e-3,
+                betas=(0.65, 0.95),
+                eps=1e-8,
+                weight_decay=0.0,
+                ortho_fn=None,
+            ),
+            muon_cfg=OptimConfig(
+                lr=0.03,
+                betas=(0.95, 0.95),
+                eps=1e-8,
+                weight_decay=1.2,
+                ortho_fn=newtonschulz5,
+            ),
             # eval and logging
             val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
             vals_per_ckpt=0,  # 0 for only at end
