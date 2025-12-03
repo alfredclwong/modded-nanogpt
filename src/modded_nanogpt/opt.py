@@ -1,15 +1,36 @@
+from typing import Callable
+
 import torch
 import torch.distributed as dist
+
+
+@torch.compile(dynamic=False, fullgraph=True)
+def newtonschulz5(G: torch.Tensor, steps: int = 5, eps: float = 1e-7) -> torch.Tensor:
+    assert G.ndim == 2
+    a, b, c = (3.4445, -4.7750, 2.0315)
+    X = G.bfloat16()
+    X /= X.norm() + eps
+    if G.size(0) > G.size(1):
+        X = X.T
+    for _ in range(steps):
+        A = X @ X.T
+        B = b * A + c * A @ A
+        X = a * X + B @ X
+    if G.size(0) > G.size(1):
+        X = X.T
+    return X
 
 
 class DistAdam(torch.optim.Optimizer):
     def __init__(
         self,
         params,
-        lr: float = 1e-3,
-        betas: tuple[float, float] = (0.9, 0.999),
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
+        *,
+        lr: float,
+        betas: tuple[float, float],
+        eps: float,
+        weight_decay: float,
+        ortho_fn: Callable[[torch.Tensor], torch.Tensor] | None,
     ):
         self.world_size = dist.get_world_size() if dist.is_initialized() else 1
         defaults = dict(lr=lr, betas=betas, eps=eps, weight_decay=weight_decay)
@@ -46,6 +67,8 @@ class DistAdam(torch.optim.Optimizer):
         self._reduce_scatter_hooks = []
         self._reduce_scatter_futures = {}
         self.register_backward_hooks()
+
+        self.ortho_fn = ortho_fn
 
     def _get_padded_size(self, size: int) -> int:
         """Calculate padded size to make it divisible by world_size."""
@@ -136,7 +159,10 @@ class DistAdam(torch.optim.Optimizer):
                     p_slice.mul_(1 - eff_weight_decay)
                 # update running averages
                 exp_avg.mul_(beta1).add_(g_slice, alpha=1 - beta1)
-                exp_avg_sq.mul_(beta2).addcmul_(g_slice, g_slice, value=1 - beta2)
+                exp_avg_sq.mul_(beta2).addcmul_(exp_avg, exp_avg, value=1 - beta2)
+                # orthogonalisation step
+                if self.ortho_fn is not None:
+                    exp_avg = self.ortho_fn(exp_avg)
                 # bias corrections
                 bias1 = 1 - beta1**t
                 bias2 = 1 - beta2**t

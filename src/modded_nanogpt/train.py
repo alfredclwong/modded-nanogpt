@@ -1,5 +1,7 @@
 import uuid
 from dataclasses import dataclass
+from typing import Callable
+from collections import Counter
 
 import torch
 import torch.distributed as dist
@@ -26,9 +28,11 @@ class TrainConfig:
 
     # optimisation
     num_steps: int
-    lr: float
+    lr_adam: float
+    lr_muon: float
     weight_decay: float
-    betas: tuple
+    betas: tuple[float, float]
+    ortho_fn: Callable[[torch.Tensor], torch.Tensor]
 
     # eval and logging
     val_steps: int
@@ -47,22 +51,31 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
         align_to_bos=True,
         device=device,
     )
-    opt_kwargs = dict(
-        lr=train_cfg.lr,
+    opt_kwargs: dict = dict(
         weight_decay=train_cfg.weight_decay,
         betas=train_cfg.betas,
+        eps=1e-8,
     )
+
+    adam_params = []
+    muon_params = []
+    for n, p in model.named_parameters():
+        if any(x == model_cfg.vocab_size for x in p.shape) or p.ndim < 2:
+            adam_params.append(p)
+        else:
+            muon_params.append(p)
+    adam_param_shapes = Counter([tuple(p.shape) for p in adam_params])
+    muon_param_shapes = Counter([tuple(p.shape) for p in muon_params])
+    print(f"Adam param shapes: {adam_param_shapes}")
+    print(f"Muon param shapes: {muon_param_shapes}")
+
     if dist.is_initialized():
-        optimiser = DistAdam(model.parameters(), **opt_kwargs)
-        print(
-            {
-                shape: len(group["params"])
-                for group in optimiser.param_groups
-                for shape in {p.shape for p in group["params"]}
-            }
-        )
+        optimisers = [
+            DistAdam(adam_params, ortho_fn=None, lr=train_cfg.lr_adam, **opt_kwargs),
+            DistAdam(muon_params, ortho_fn=train_cfg.ortho_fn, lr=train_cfg.lr_muon, **opt_kwargs),
+        ]
     else:
-        optimiser = torch.optim.AdamW(model.parameters(), **opt_kwargs)
+        optimisers = [torch.optim.AdamW(model.parameters(), lr=train_cfg.lr_adam, **opt_kwargs)]
 
     if model.yoco:
         L = len(model.blocks) // 2  # 2 blocks per layer because of HC
@@ -141,8 +154,10 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
             total=train_cfg.grad_accum_steps,
             leave=False,
         ):
-            if isinstance(optimiser, DistAdam) and i == train_cfg.grad_accum_steps - 1:
-                optimiser.should_sync = True
+            if i == train_cfg.grad_accum_steps - 1:
+                for optimiser in optimisers:
+                    if isinstance(optimiser, DistAdam):
+                        optimiser.should_sync = True
             inputs, targets, seqlens = next(train_loader)
             loss = model(inputs, targets, seqlens, window_sizes)
             loss = loss / train_cfg.grad_accum_steps
@@ -153,10 +168,13 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
                 * world_size
             )
             loss.backward()
-        optimiser.step()
-        optimiser.zero_grad(set_to_none=True)
-        if isinstance(optimiser, DistAdam):
-            optimiser.should_sync = False
+        for optimiser in optimisers:
+            if isinstance(optimiser, DistAdam):
+                optimiser.should_sync = False
+                if optimiser.ortho_fn is None and step % 2 == 0:
+                    continue  # skip every other step for adamw
+            optimiser.step()
+            optimiser.zero_grad(set_to_none=True)
         if train_cfg.use_wandb:
             wandb.log({"train/loss": batch_loss.item()}, step=step)
     if train_cfg.use_wandb:
@@ -173,6 +191,7 @@ if __name__ == "__main__":
     from torch.nn import ReLU
 
     from modded_nanogpt.gpt import GPTConfig, ReLU2, RMSNorm
+    from modded_nanogpt.opt import newtonschulz5
     from modded_nanogpt.util import is_cuda
 
     device = (
@@ -230,7 +249,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 16 if not is_cuda(device) else 2
+        VRAM_FACTOR = 16 if not is_cuda(device) else 4
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -253,9 +272,11 @@ if __name__ == "__main__":
             val_batch_tokens=VAL_BATCH_TOKENS,
             # optimisation
             num_steps=max(1, TRAIN_STEPS // DEBUG_FACTOR),
-            lr=3e-4,
+            lr_adam=3e-4,
+            lr_muon=3e-2,
             weight_decay=0.0,
-            betas=(0.9, 0.999),
+            betas=(0.95, 0.95),
+            ortho_fn=newtonschulz5,
             # eval and logging
             val_steps=max(1, TRAIN_STEPS // 20 // DEBUG_FACTOR),  # 0 for only at end
             vals_per_ckpt=0,  # 0 for only at end
@@ -282,7 +303,7 @@ if __name__ == "__main__":
             window_size=256,
             shc_lr_mul=100.0,
             dhc_lr_mul=10.0,
-            kernel_options = {
+            kernel_options={
                 "BLOCK_M": 128 // VRAM_FACTOR,
                 "BLOCK_N": 128 // VRAM_FACTOR,
                 "BLOCK_M1": 64 // VRAM_FACTOR,
