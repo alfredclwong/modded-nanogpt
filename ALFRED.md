@@ -42,6 +42,8 @@ Plan:
    - yarn [todo], warmup [todo]
 6. YOCO
 7. Muon
+   - BUG: need to scatter the stacked params/grads instead of catted! But somehow it's working...
+   - also muon only makes sense on linear layers
 
 Runs
 - stoic-resonance-3, mmm4, VF=32 T=1024, #0, 111s/step
@@ -82,6 +84,9 @@ Runs
 - honest-sea-67, #6 (wd=0.0, 2nd moment off)
 - jumping-sun-68, #6 (zero init for outputs)
 - helpful-bee-69, #6 (yoco)
+- curious-smoke-73, #6 (yoco dhc1 long run)
+- flowing-leaf-74, MUON KILLED IT? orthog op is weird on HC. it was fine on 2x2!
+- worldly-morning-76, Adam on HC weights, DHC=2, TODO stack params
 
 Highlights
 1. Baseline multi-GPU run

@@ -54,7 +54,7 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
         if any(x == model_cfg.vocab_size for x in p.shape) or p.ndim < 2:
             adam_params.append(p)
         elif p.label in ["dhc", "shc"]:
-            muon_params.append(p)
+            adam_params.append(p)
         else:
             muon_params.append(p)
     adam_param_shapes = Counter([tuple(p.shape) for p in adam_params])
