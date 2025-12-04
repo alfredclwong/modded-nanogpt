@@ -53,6 +53,8 @@ def train(model: GPT, train_cfg: TrainConfig, device: str | torch.device):
     for n, p in model.named_parameters():
         if any(x == model_cfg.vocab_size for x in p.shape) or p.ndim < 2:
             adam_params.append(p)
+        elif p.label in ["dhc", "shc"]:
+            muon_params.append(p)
         else:
             muon_params.append(p)
     adam_param_shapes = Counter([tuple(p.shape) for p in adam_params])
@@ -190,7 +192,7 @@ if __name__ == "__main__":
     from torch.nn import ReLU
 
     from modded_nanogpt.gpt import GPTConfig, ReLU2, RMSNorm
-    from modded_nanogpt.opt import newtonschulz5, get_lr_schedule
+    from modded_nanogpt.opt import get_lr_schedule, newtonschulz5
     from modded_nanogpt.util import is_cuda
 
     device = (
@@ -248,7 +250,7 @@ if __name__ == "__main__":
 
         # reduces mini batch size and sequence length (if > 16),
         # increases grad accum steps to keep tokens per batch constant
-        VRAM_FACTOR = 16 if not is_cuda(device) else 2
+        VRAM_FACTOR = 16 if not is_cuda(device) else 4
 
         GRAD_ACCUM_STEPS = 8 * VRAM_FACTOR
         MINI_BATCH_SIZE = max(1, 16 // VRAM_FACTOR)
@@ -260,7 +262,9 @@ if __name__ == "__main__":
         # VAL_BATCH_TOKENS = TRAIN_BATCH_TOKENS
         VAL_BATCH_TOKENS = 2_097_152 // VRAM_FACTOR // 2
 
-        lr_schedule_fn = partial(get_lr_schedule, num_steps=TRAIN_STEPS * DEBUG_FACTOR, cooldown_frac=0.5)
+        lr_schedule_fn = partial(
+            get_lr_schedule, num_steps=TRAIN_STEPS * DEBUG_FACTOR, cooldown_frac=0.5
+        )
         # lr_schedule_fn = None
         train_cfg = TrainConfig(
             # data
@@ -308,13 +312,13 @@ if __name__ == "__main__":
             qk_norm=True,
             act=ReLU2,
             bf16=True,
-            hc=False,
+            hc=True,
             dynamic=True,
-            expansion_rate=2,
+            expansion_rate=1,
             dnorm=partial(RMSNorm, elementwise_affine=False),
             window_size=256,
-            shc_lr_mul=100.0,
-            dhc_lr_mul=10.0,
+            shc_lr_mul=1.0,
+            dhc_lr_mul=1.0,
             kernel_options={
                 "BLOCK_M": 128 // VRAM_FACTOR,
                 "BLOCK_N": 128 // VRAM_FACTOR,

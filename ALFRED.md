@@ -81,6 +81,7 @@ Runs
 - driven-firely-66, 2x rtx4070S, VF=2, #6 (wd_muon=1.2, 2nd moment for muon),
 - honest-sea-67, #6 (wd=0.0, 2nd moment off)
 - jumping-sun-68, #6 (zero init for outputs)
+- helpful-bee-69, #6 (yoco)
 
 Highlights
 1. Baseline multi-GPU run

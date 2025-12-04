@@ -63,7 +63,9 @@ class GPT(torch.nn.Module):
         self.num_heads = model_cfg.num_heads
         if self.yoco:
             self.norm = model_cfg.norm(model_cfg.dim, bias=False)
-            self.w_kv = torch.nn.Parameter(torch.empty(model_cfg.dim, 2 * model_cfg.dim))
+            self.w_kv = torch.nn.Parameter(
+                torch.empty(model_cfg.dim, 2 * model_cfg.dim)
+            )
             self.w_kv.label = "global"  # type: ignore
             with torch.no_grad():
                 torch.nn.init.normal_(self.w_kv, mean=0.0, std=0.02)
@@ -104,8 +106,8 @@ class GPT(torch.nn.Module):
                     m.bfloat16()
 
         for p in self.token_emb.parameters():
-            p.lr_mul = 75.
-        self.head.weight.lr_mul = 1.
+            p.lr_mul = 75.0
+        self.head.weight.lr_mul = 1.0
 
     def forward(
         self,
@@ -172,7 +174,9 @@ class GPT(torch.nn.Module):
                 kernel_options=self.kernel_options,
                 kv=kv,
             )
-            if self.yoco and i == len(self.blocks) // 2 - 1:  # evaluate global kv after first L/2 blocks
+            if (
+                self.yoco and i == len(self.blocks) // 2 - 1
+            ):  # evaluate global kv after first L/2 blocks
                 kv = torch.nn.functional.linear(
                     self.norm(x),
                     self.w_kv.T.type_as(x),
@@ -381,8 +385,8 @@ class Attention(torch.nn.Module):
         self.w.label = "attn"  # type: ignore
 
         with torch.no_grad():
-            self.w.view(4, dim, dim)[:3].normal_(0, 0.02)
-            self.w.view(4, dim, dim)[-1].zero_()
+            self.w.view(-1, dim, dim)[:-1].normal_(0, 0.02)
+            self.w.view(-1, dim, dim)[-1].zero_()
 
     def forward(
         self,
@@ -477,7 +481,7 @@ class MLP(torch.nn.Module):
         super().__init__()
         self.c_fc = torch.nn.Parameter(torch.empty(dim, 4 * dim))
         self.c_fc.label = "mlp"
-        self.c_fc.lr_mul = 2.  # to account for transpose?
+        self.c_fc.lr_mul = 2.0  # to account for transpose?
         self.act = act()
         self.c_proj = torch.nn.Parameter(
             torch.empty(dim, 4 * dim)
